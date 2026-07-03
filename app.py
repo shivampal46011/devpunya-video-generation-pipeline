@@ -399,6 +399,45 @@ with st.sidebar:
                         st.rerun()
                     except Exception as e:  # noqa: BLE001
                         st.error(f"Sign-in failed: {str(e)[:200]}")
+                        st.caption("No browser on this server? Use the manual link below.")
+
+                with st.expander("Manual link (for deployed apps)"):
+                    from google_auth_oauthlib.flow import Flow
+                    if "oauth_manual" not in st.session_state:
+                        flow = Flow.from_client_secrets_file(
+                            str(CLIENT_SECRET_PATH), scopes=DRIVE_SCOPES,
+                            redirect_uri="http://localhost")
+                        auth_url, _ = flow.authorization_url(
+                            access_type="offline", prompt="consent")
+                        st.session_state.oauth_manual = {
+                            "url": auth_url, "verifier": flow.code_verifier}
+                    st.markdown(
+                        f"1. [Open the Google sign-in page]({st.session_state.oauth_manual['url']}) "
+                        "and approve access.\n"
+                        "2. Your browser will land on a `localhost` page that fails to "
+                        "load — **that's expected**. Copy that page's full URL from the "
+                        "address bar and paste it here:")
+                    pasted = st.text_input("Redirect URL (or just the code= value)",
+                                           key="oauth_code_paste")
+                    if pasted.strip():
+                        try:
+                            code = pasted.strip()
+                            if "code=" in code:
+                                from urllib.parse import parse_qs, urlparse
+                                code = parse_qs(urlparse(code).query)["code"][0]
+                            flow = Flow.from_client_secrets_file(
+                                str(CLIENT_SECRET_PATH), scopes=DRIVE_SCOPES,
+                                redirect_uri="http://localhost")
+                            flow.code_verifier = st.session_state.oauth_manual["verifier"]
+                            flow.fetch_token(code=code)
+                            DRIVE_TOKEN_PATH.write_text(flow.credentials.to_json())
+                            del st.session_state.oauth_manual
+                            st.success("Drive linked!")
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"Could not exchange the code: {str(e)[:200]}")
+                    st.caption("Alternative: upload your local `drive_token.json` in "
+                               "the Credentials setup section above.")
                 drive_enabled = False
             else:
                 st.warning("Drive is not linked yet.")
