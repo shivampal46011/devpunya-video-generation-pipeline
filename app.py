@@ -30,6 +30,9 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = "gemini-omni-flash-preview"
 API_REVISION = "2026-05-20"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+CLIENT_SECRET_PATH = Path(__file__).parent / "client_secret.json"
+DRIVE_TOKEN_PATH = Path(__file__).parent / "drive_token.json"
 
 st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout="wide")
 
@@ -162,6 +165,94 @@ def generate_video(auth: dict, model: str, prompt_text: str,
 
 
 # ---------------------------------------------------------------------------
+# Google Drive
+# ---------------------------------------------------------------------------
+
+def get_drive_creds(interactive: bool = False):
+    """Load cached Drive OAuth credentials; optionally run the sign-in flow.
+
+    Uses the user's own OAuth client (client_secret.json) because Google
+    blocks the shared gcloud client for the Drive scope. The token is cached
+    in drive_token.json, so sign-in happens only once.
+    """
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+
+    creds = None
+    if DRIVE_TOKEN_PATH.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_PATH), DRIVE_SCOPES)
+        except Exception:  # noqa: BLE001 — corrupt token file, re-auth
+            creds = None
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            DRIVE_TOKEN_PATH.write_text(creds.to_json())
+        except Exception:  # noqa: BLE001
+            creds = None
+    if (not creds or not creds.valid) and interactive and CLIENT_SECRET_PATH.exists():
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET_PATH), DRIVE_SCOPES)
+        creds = flow.run_local_server(port=0, open_browser=True)
+        DRIVE_TOKEN_PATH.write_text(creds.to_json())
+    return creds if creds and creds.valid else None
+
+
+def get_drive_service():
+    from googleapiclient.discovery import build
+    creds = get_drive_creds()
+    if not creds:
+        raise RuntimeError("Google Drive is not linked yet.")
+    return build("drive", "v3", credentials=creds)
+
+
+@st.cache_data(ttl=300)
+def list_drive_folders():
+    """Folders the user can pick as an upload destination."""
+    service = get_drive_service()
+    res = service.files().list(
+        q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+        pageSize=100,
+        fields="files(id, name)",
+        orderBy="name",
+    ).execute()
+    return res.get("files", [])
+
+
+def parse_drive_folder_id(text: str) -> str:
+    """Accept a raw folder ID or a drive.google.com/.../folders/<id> link."""
+    text = text.strip()
+    if "/folders/" in text:
+        text = text.split("/folders/", 1)[1]
+    return text.split("?")[0].split("/")[0]
+
+
+def upload_to_drive(path: str, folder_id: str) -> str:
+    """Upload one video to Drive; returns the webViewLink."""
+    from googleapiclient.http import MediaFileUpload
+    service = get_drive_service()
+    meta = {"name": Path(path).name, "parents": [folder_id]}
+    media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
+    created = service.files().create(
+        body=meta, media_body=media, fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return created["webViewLink"]
+
+
+DRIVE_SETUP_HELP = f"""\
+**One-time setup (your own OAuth app — Google blocks the shared gcloud one):**
+1. Enable the Drive API: [console link](https://console.cloud.google.com/apis/library/drive.googleapis.com?project=devpunya-c7c68)
+2. [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent?project=devpunya-c7c68): \
+choose **External**, fill the required fields, and add your own email under **Test users**.
+3. [Credentials](https://console.cloud.google.com/apis/credentials?project=devpunya-c7c68) → \
+**Create credentials → OAuth client ID → Desktop app**, then **download the JSON** and save it as:
+   `{CLIENT_SECRET_PATH}`
+4. Reload this page and click **Link Google Drive**.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
@@ -214,6 +305,50 @@ with st.sidebar:
     max_workers = st.slider("Parallel generations", 1, 4, 1,
                             help="Keep at 1 unless your Vertex per-minute quota "
                                  "allows more — parallel requests hit 429s.")
+
+    st.divider()
+    st.subheader("☁️ Google Drive")
+    drive_enabled = st.toggle("Upload generated videos to Drive")
+    drive_folder_id = None
+    if drive_enabled:
+        linked = get_drive_creds() is not None
+        if not linked:
+            if CLIENT_SECRET_PATH.exists():
+                st.info("Click below — a Google sign-in page will open in your browser. "
+                        "On the warning screen choose **Advanced → Go to app (unsafe)** "
+                        "(it's your own app, this is safe).")
+                if st.button("🔗 Link Google Drive", type="primary", use_container_width=True):
+                    try:
+                        get_drive_creds(interactive=True)
+                        st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Sign-in failed: {str(e)[:200]}")
+                drive_enabled = False
+            else:
+                st.warning("Drive is not linked yet.")
+                st.markdown(DRIVE_SETUP_HELP)
+                drive_enabled = False
+        else:
+            try:
+                folders = list_drive_folders()
+                options = {"My Drive (root)": "root"}
+                options.update({f["name"]: f["id"] for f in folders})
+                chosen = st.selectbox("Drive folder", list(options.keys()))
+                drive_folder_id = options[chosen]
+                custom = st.text_input(
+                    "…or paste a folder link / ID (overrides the picker)",
+                    placeholder="https://drive.google.com/drive/folders/…",
+                )
+                if custom.strip():
+                    drive_folder_id = parse_drive_folder_id(custom)
+                st.caption(f"Uploading to folder ID: `{drive_folder_id}`")
+                if st.button("Unlink Drive"):
+                    DRIVE_TOKEN_PATH.unlink(missing_ok=True)
+                    st.cache_data.clear()
+                    st.rerun()
+            except Exception as e:  # noqa: BLE001
+                drive_enabled = False
+                st.error(f"Drive error: {str(e)[:200]}")
 
     st.divider()
     st.caption(f"Output folder: `{OUTPUT_DIR}`")
@@ -321,6 +456,17 @@ if run_clicked:
                          f"{'✅ ok' if result['ok'] else '❌ ' + str(result['error'])[:80]}",
                 )
 
+        # Auto-upload the new videos to the chosen Drive folder.
+        if drive_enabled and drive_folder_id:
+            uploads = [r for job, _ in work for r in job.get("results", [])
+                       if r["ok"] and not r.get("drive_link")]
+            for k, result in enumerate(uploads, 1):
+                progress.progress(1.0, text=f"Uploading to Drive {k}/{len(uploads)}…")
+                try:
+                    result["drive_link"] = upload_to_drive(result["path"], drive_folder_id)
+                except Exception as e:  # noqa: BLE001
+                    result["drive_error"] = str(e)[:200]
+
         st.session_state.running = False
         st.rerun()
 
@@ -328,6 +474,22 @@ if run_clicked:
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
+
+ok_paths = [r["path"] for j in jobs for r in j.get("results") or []
+            if r["ok"] and Path(r["path"]).exists()]
+if ok_paths:
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for p in ok_paths:
+            zf.write(p, arcname=Path(p).name)
+    st.download_button(
+        f"⬇️ Download all {len(ok_paths)} video(s) as ZIP",
+        data=buf.getvalue(),
+        file_name=f"videos_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        mime="application/zip",
+    )
 
 for job in jobs:
     icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}[job["status"]]
@@ -348,13 +510,28 @@ for job in jobs:
                 if result["ok"]:
                     st.video(result["path"])
                     st.caption(f"Variation {i + 1} · {result['elapsed']:.0f}s · `{result['path']}`")
-                    st.download_button(
-                        "⬇️ Download MP4",
-                        data=Path(result["path"]).read_bytes(),
-                        file_name=Path(result["path"]).name,
-                        mime="video/mp4",
-                        key=f"dl_{job['id']}_{i}",
-                    )
+                    dl_col, drive_col = st.columns(2)
+                    with dl_col:
+                        st.download_button(
+                            "⬇️ Download MP4",
+                            data=Path(result["path"]).read_bytes(),
+                            file_name=Path(result["path"]).name,
+                            mime="video/mp4",
+                            key=f"dl_{job['id']}_{i}",
+                        )
+                    with drive_col:
+                        if result.get("drive_link"):
+                            st.link_button("☁️ View on Drive", result["drive_link"])
+                        elif result.get("drive_error"):
+                            st.caption(f"Drive upload failed: {result['drive_error']}")
+                        elif drive_enabled and drive_folder_id:
+                            if st.button("☁️ Upload to Drive", key=f"up_{job['id']}_{i}"):
+                                try:
+                                    result["drive_link"] = upload_to_drive(
+                                        result["path"], drive_folder_id)
+                                except Exception as e:  # noqa: BLE001
+                                    result["drive_error"] = str(e)[:200]
+                                st.rerun()
                     if result["text"]:
                         st.caption(f"Model notes: {result['text'][:300]}")
                 else:

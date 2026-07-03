@@ -3,3 +3,5 @@ generated_videos/
 __pycache__/
 *.pyc
 .DS_Store
+client_secret.json
+drive_token.json
