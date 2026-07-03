@@ -90,12 +90,23 @@ def extract_video_bytes(interaction) -> tuple[bytes | None, str]:
 
 
 def make_client(auth: dict) -> genai.Client:
-    """Build a Vertex AI client (bills the GCP project)."""
+    """Build a Vertex AI client (bills the GCP project).
+
+    Locally, uses gcloud application-default credentials. When deployed,
+    a `gcp_service_account` table in Streamlit secrets takes over.
+    """
+    kwargs = {}
+    sa_info = _secret("gcp_service_account")
+    if sa_info:
+        from google.oauth2 import service_account
+        kwargs["credentials"] = service_account.Credentials.from_service_account_info(
+            dict(sa_info), scopes=["https://www.googleapis.com/auth/cloud-platform"])
     return genai.Client(
         vertexai=True,
         project=auth["project"],
         location=auth["location"],
         http_options=types.HttpOptions(headers={"Api-Revision": API_REVISION}),
+        **kwargs,
     )
 
 
@@ -168,6 +179,14 @@ def generate_video(auth: dict, model: str, prompt_text: str,
 # Google Drive
 # ---------------------------------------------------------------------------
 
+def _secret(key):
+    """Read a Streamlit secret; returns None when no secrets are configured."""
+    try:
+        return st.secrets[key]
+    except Exception:  # noqa: BLE001 — missing secrets.toml or key
+        return None
+
+
 def get_drive_creds(interactive: bool = False):
     """Load cached Drive OAuth credentials; optionally run the sign-in flow.
 
@@ -183,6 +202,15 @@ def get_drive_creds(interactive: bool = False):
         try:
             creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_PATH), DRIVE_SCOPES)
         except Exception:  # noqa: BLE001 — corrupt token file, re-auth
+            creds = None
+    if creds is None and _secret("drive_token"):
+        # Deployed mode: token pasted into Streamlit secrets (link locally
+        # first, then copy drive_token.json contents into the secret).
+        import json
+        try:
+            creds = Credentials.from_authorized_user_info(
+                json.loads(_secret("drive_token")), DRIVE_SCOPES)
+        except Exception:  # noqa: BLE001
             creds = None
     if creds and creds.expired and creds.refresh_token:
         try:
