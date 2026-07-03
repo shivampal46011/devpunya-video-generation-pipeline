@@ -12,6 +12,7 @@ Run:
 
 import base64
 import concurrent.futures
+import json
 import time
 import uuid
 from datetime import datetime
@@ -33,6 +34,7 @@ API_REVISION = "2026-05-20"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 CLIENT_SECRET_PATH = Path(__file__).parent / "client_secret.json"
 DRIVE_TOKEN_PATH = Path(__file__).parent / "drive_token.json"
+SA_KEY_PATH = Path(__file__).parent / "service_account.json"
 
 st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout="wide")
 
@@ -96,11 +98,15 @@ def make_client(auth: dict) -> genai.Client:
     a `gcp_service_account` table in Streamlit secrets takes over.
     """
     kwargs = {}
-    sa_info = _secret("gcp_service_account")
+    sa_info = None
+    if SA_KEY_PATH.exists():
+        sa_info = json.loads(SA_KEY_PATH.read_text())
+    elif _secret("gcp_service_account"):
+        sa_info = dict(_secret("gcp_service_account"))
     if sa_info:
         from google.oauth2 import service_account
         kwargs["credentials"] = service_account.Credentials.from_service_account_info(
-            dict(sa_info), scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            sa_info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
     return genai.Client(
         vertexai=True,
         project=auth["project"],
@@ -333,6 +339,48 @@ with st.sidebar:
     max_workers = st.slider("Parallel generations", 1, 4, 1,
                             help="Keep at 1 unless your Vertex per-minute quota "
                                  "allows more — parallel requests hit 429s.")
+
+    st.divider()
+    with st.expander("🔑 Credentials setup"):
+        st.caption("Upload any credential JSON — the app detects what it is: "
+                   "a **service account key** (used for Vertex video generation), "
+                   "an **OAuth client secret**, or a **Drive token**.")
+        cred_files = st.file_uploader(
+            "Credential JSON file(s)", type=["json"],
+            accept_multiple_files=True, key="cred_upload",
+        )
+        for cf in cred_files or []:
+            try:
+                info = json.loads(cf.getvalue())
+            except Exception:  # noqa: BLE001
+                st.error(f"{cf.name}: not valid JSON")
+                continue
+            if "private_key" in info and "client_email" in info:
+                SA_KEY_PATH.write_text(json.dumps(info))
+                st.success(f"{cf.name} → saved as **service account key** "
+                           f"(`{info['client_email']}`)")
+            elif "installed" in info or "web" in info:
+                CLIENT_SECRET_PATH.write_text(json.dumps(info))
+                st.success(f"{cf.name} → saved as **OAuth client secret**")
+            elif "refresh_token" in info:
+                DRIVE_TOKEN_PATH.write_text(json.dumps(info))
+                st.success(f"{cf.name} → saved as **Drive token** (Drive is linked)")
+            else:
+                st.error(f"{cf.name}: unrecognized credential format")
+
+        active = []
+        if SA_KEY_PATH.exists():
+            active.append("service account ✅")
+        if CLIENT_SECRET_PATH.exists():
+            active.append("client secret ✅")
+        if DRIVE_TOKEN_PATH.exists():
+            active.append("drive token ✅")
+        st.caption("Stored: " + (", ".join(active) if active else "none") +
+                   " · Generation uses the service account if present, else "
+                   "your gcloud login.")
+        if SA_KEY_PATH.exists() and st.button("Remove service account key"):
+            SA_KEY_PATH.unlink()
+            st.rerun()
 
     st.divider()
     st.subheader("☁️ Google Drive")
