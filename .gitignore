@@ -1,0 +1,5 @@
+.venv/
+generated_videos/
+__pycache__/
+*.pyc
+.DS_Store
