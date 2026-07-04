@@ -758,7 +758,12 @@ with st.sidebar:
 
     st.divider()
     st.subheader("☁️ Google Drive")
-    drive_enabled = st.toggle("Upload generated videos to Drive")
+    _settings = load_settings()
+    drive_enabled = st.toggle("Upload generated videos to Drive",
+                              value=_settings.get("drive_upload_enabled", True))
+    if drive_enabled != _settings.get("drive_upload_enabled", True):
+        _settings["drive_upload_enabled"] = drive_enabled
+        save_settings(_settings)
     drive_folder_id = None
     if drive_enabled:
         linked = get_drive_creds() is not None
