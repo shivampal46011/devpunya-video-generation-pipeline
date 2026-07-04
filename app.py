@@ -31,6 +31,83 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = "gemini-omni-flash-preview"
 API_REVISION = "2026-05-20"
+
+VIDEO_MODELS = ["gemini-omni-flash-preview"]
+IMAGE_MODELS = ["imagen-3.0-generate-002", "imagen-3.0-fast-generate-001"]
+VIDEO_ASPECTS = ["9:16", "16:9", "1:1"]
+IMAGE_ASPECTS = ["9:16", "16:9", "1:1", "3:4", "4:3"]
+
+PLATFORM_GUIDELINES = {
+    "Instagram Reels": "Platform: Instagram Reels — vertical full-frame, bold text-overlay "
+        "safe zones top/bottom, fast-paced cuts, must work with sound OFF.",
+    "YouTube Shorts": "Platform: YouTube Shorts — vertical full-frame, first frame must be "
+        "instantly readable as a thumbnail, punchy pacing, strong loop-back ending.",
+    "TikTok": "Platform: TikTok — vertical, raw energetic feel, immediate movement in "
+        "frame one, trend-aware visual language.",
+    "YouTube (long-form)": "Platform: YouTube long-form — cinematic widescreen framing, "
+        "title-card quality composition, documentary polish.",
+    "Facebook": "Platform: Facebook feed — high-contrast visuals readable inline, "
+        "emotionally warm and shareable.",
+    "WhatsApp Status": "Platform: WhatsApp Status — vertical, warm personal tone, "
+        "clear even on small screens and low bandwidth.",
+}
+
+PURPOSE_GUIDELINES = {
+    "Devotional storytelling": "Purpose: devotional storytelling — a narrative arc of "
+        "longing/seeking that resolves into darshan or divine grace; evoke deep bhakti.",
+    "Motivation / inspiration": "Purpose: motivation — frame the spiritual message as "
+        "empowering life wisdom; imagery of rising, overcoming, awakening.",
+    "Festival greeting": "Purpose: festival greeting — celebratory mood with diyas, "
+        "rangoli, flowers and warm golden glow that clearly evokes the occasion.",
+    "Bhajan / mantra visual": "Purpose: bhajan/mantra visual — meditative rhythmic "
+        "imagery fit for chanting: repeating sacred motifs, slow powerful zooms, "
+        "hypnotic symmetry.",
+    "Teaching / discourse clip": "Purpose: teaching clip — calm dignified framing that "
+        "keeps full attention on the message; minimal visual distraction.",
+}
+
+SPIRITUAL_DIRECTIVE = (
+    "Context (mandatory): deeply SPIRITUAL and devotional — rooted in Indian sacred "
+    "aesthetics: temples, deities, diyas, incense smoke curling in light beams, sacred "
+    "geometry, golden-hour divine light, Ganga aarti, Himalayan ashrams, om symbols. "
+    "Tone: reverent, awe-inspiring, emotionally uplifting; always respectful and "
+    "accurate to tradition."
+)
+
+HOOK_DIRECTIVE_VIDEO = (
+    "Retention engineering (CRITICAL): the FIRST 1.5 seconds must be an irresistible "
+    "hook — open mid-action at the single most stunning moment (divine reveal, dramatic "
+    "light burst, extreme close-up of eyes opening) — never a slow fade-in or "
+    "establishing shot. Escalate visual interest every 2-3 seconds with a new angle, "
+    "reveal or transformation so there is no static lull. Build to an emotional payoff "
+    "in the final 2 seconds and END on a frame that loops seamlessly back to the "
+    "opening shot to drive rewatches."
+)
+
+HOOK_DIRECTIVE_IMAGE = (
+    "Scroll-stopping composition: one dominant subject, extreme light/dark contrast, "
+    "dramatic divine lighting, depth and scale that reads instantly at thumbnail size."
+)
+
+
+def build_final_prompt(user_prompt: str, is_video: bool, aspect_ratio: str,
+                       platform: str, purpose: str, spiritual: bool,
+                       high_retention: bool, duration_s: int) -> str:
+    """Layer the style directives onto the user's prompt."""
+    parts = [user_prompt.strip()]
+    if spiritual:
+        parts.append(SPIRITUAL_DIRECTIVE)
+    if high_retention:
+        parts.append(HOOK_DIRECTIVE_VIDEO if is_video else HOOK_DIRECTIVE_IMAGE)
+    if platform in PLATFORM_GUIDELINES:
+        parts.append(PLATFORM_GUIDELINES[platform])
+    if purpose in PURPOSE_GUIDELINES:
+        parts.append(PURPOSE_GUIDELINES[purpose])
+    tail = f"STRICT {aspect_ratio} aspect ratio — the frame must be exactly {aspect_ratio}."
+    if is_video:
+        tail += f" Target duration ~{duration_s} seconds."
+    parts.append(tail)
+    return "\n\n".join(parts)
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 CLIENT_SECRET_PATH = Path(__file__).parent / "client_secret.json"
 DRIVE_TOKEN_PATH = Path(__file__).parent / "drive_token.json"
@@ -118,7 +195,7 @@ def make_client(auth: dict) -> genai.Client:
 
 def generate_video(auth: dict, model: str, prompt_text: str,
                    image_bytes: bytes | None, image_mime: str | None,
-                   duration_s: int, thinking_level: str,
+                   duration_s: int, thinking_level: str, aspect_ratio: str = "9:16",
                    max_retries: int = 3) -> dict:
     """Generate one video. Returns {ok, path, text, error, elapsed}."""
     client = make_client(auth)
@@ -137,6 +214,7 @@ def generate_video(auth: dict, model: str, prompt_text: str,
         "response_format": {
             "type": "video",
             "duration": f"{duration_s}s",
+            "aspect_ratio": aspect_ratio,
         },
     }
 
@@ -177,6 +255,42 @@ def generate_video(auth: dict, model: str, prompt_text: str,
             if attempt < max_retries:
                 time.sleep(2 * attempt)
 
+    return {"ok": False, "path": None, "text": None,
+            "error": str(last_err), "elapsed": time.time() - started}
+
+
+def generate_image(auth: dict, model: str, prompt_text: str,
+                   aspect_ratio: str, max_retries: int = 3) -> dict:
+    """Generate one image with Imagen. Aspect ratio is enforced by the API."""
+    client = make_client(auth)
+    started = time.time()
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = client.models.generate_images(
+                model=model,
+                prompt=prompt_text,
+                config=types.GenerateImagesConfig(
+                    number_of_images=1,
+                    aspect_ratio=aspect_ratio,
+                ),
+            )
+            if not res.generated_images:
+                raise RuntimeError("Model returned no image (possibly safety-filtered)")
+            img_bytes = res.generated_images[0].image.image_bytes
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = OUTPUT_DIR / f"image_{stamp}_{uuid.uuid4().hex[:6]}.png"
+            path.write_bytes(img_bytes)
+            return {"ok": True, "path": str(path), "text": None,
+                    "error": None, "elapsed": time.time() - started}
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = str(e).lower()
+            if "429" in msg or "quota" in msg:
+                if attempt < max_retries:
+                    time.sleep(65)
+            elif attempt < max_retries:
+                time.sleep(2 * attempt)
     return {"ok": False, "path": None, "text": None,
             "error": str(last_err), "elapsed": time.time() - started}
 
@@ -265,8 +379,9 @@ def upload_to_drive(path: str, folder_id: str) -> str:
     """Upload one video to Drive; returns the webViewLink."""
     from googleapiclient.http import MediaFileUpload
     service = get_drive_service()
+    mime = "video/mp4" if path.endswith(".mp4") else "image/png"
     meta = {"name": Path(path).name, "parents": [folder_id]}
-    media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
+    media = MediaFileUpload(path, mimetype=mime, resumable=True)
     created = service.files().create(
         body=meta, media_body=media, fields="id, webViewLink",
         supportsAllDrives=True,
@@ -331,14 +446,34 @@ with st.sidebar:
     )
     auth = {"mode": "vertex", "project": project.strip(), "location": location.strip()}
 
-    model = st.text_input("Model", value=DEFAULT_MODEL)
-    duration_s = st.slider("Video duration (seconds)", 4, 30, 10)
-    thinking_level = st.selectbox("Thinking level", ["high", "medium", "low"], index=0)
+    st.divider()
+    mode = st.radio("Generate", ["🎬 Video", "🖼️ Image"], horizontal=True)
+    is_video = mode.startswith("🎬")
+
+    if is_video:
+        model = st.selectbox("Model", VIDEO_MODELS)
+        aspect_ratio = st.selectbox("Aspect ratio", VIDEO_ASPECTS, index=0)
+        duration_s = st.slider("Video duration (seconds)", 4, 30, 12)
+    else:
+        model = st.selectbox("Model", IMAGE_MODELS)
+        aspect_ratio = st.selectbox("Aspect ratio", IMAGE_ASPECTS, index=0)
+        duration_s = 0
+    thinking_level = st.selectbox("Thinking level", ["high", "medium", "low"], index=1)
     variations = st.number_input("Variations per prompt", 1, 5, 1,
-                                 help="Generate N videos for each prompt.")
+                                 help="Generate N outputs for each prompt.")
     max_workers = st.slider("Parallel generations", 1, 4, 1,
                             help="Keep at 1 unless your Vertex per-minute quota "
                                  "allows more — parallel requests hit 429s.")
+
+    st.divider()
+    st.subheader("🎯 Content style")
+    platform = st.selectbox("Platform (optional)", ["None"] + list(PLATFORM_GUIDELINES))
+    purpose = st.selectbox("Purpose (optional)", ["None"] + list(PURPOSE_GUIDELINES))
+    spiritual_mode = st.toggle("🕉️ Spiritual context", value=True,
+                               help="Injects devotional aesthetic direction into every prompt.")
+    high_retention = st.toggle("🔥 High hook + view-through", value=True,
+                               help="Injects retention engineering: 1.5s hook, escalation "
+                                    "every 2-3s, seamless loop ending.")
 
     st.divider()
     with st.expander("🔑 Credentials setup"):
@@ -479,41 +614,18 @@ with st.sidebar:
 st.title("🎬 Automated Video Content Pipeline")
 st.caption("Queue text + image prompts, then batch-generate videos with Gemini.")
 
-tab_single, tab_batch = st.tabs(["➕ Add job", "📋 Batch add (multiple prompts)"])
-
-with tab_single:
-    with st.form("single_job", clear_on_submit=True):
-        prompt = st.text_area("Prompt", height=120,
-                              placeholder="A cinematic drone shot over a neon city at night...")
-        image = st.file_uploader("Reference image (optional)",
-                                 type=["png", "jpg", "jpeg", "webp"])
-        if st.form_submit_button("Add to queue", type="primary"):
-            if prompt.strip():
-                add_job(prompt, image)
-                st.success("Job added.")
-            else:
-                st.warning("Prompt is empty.")
-
-with tab_batch:
-    with st.form("batch_jobs", clear_on_submit=True):
-        prompts_text = st.text_area(
-            "One prompt per line", height=160,
-            placeholder="A golden retriever surfing a wave\nTimelapse of a city skyline at dusk\nMacro shot of coffee being poured",
-        )
-        batch_images = st.file_uploader(
-            "Reference images (optional, multiple)",
-            type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True,
-            help="Matched to prompts in order. If you upload exactly one image, it is used for every prompt.",
-        )
-        if st.form_submit_button("Add all to queue", type="primary"):
-            lines = [ln for ln in prompts_text.splitlines() if ln.strip()]
-            for i, line in enumerate(lines):
-                img = None
-                if batch_images:
-                    img = batch_images[0] if len(batch_images) == 1 else (
-                        batch_images[i] if i < len(batch_images) else None)
-                add_job(line, img)
-            st.success(f"Added {len(lines)} job(s).")
+with st.form("single_job", clear_on_submit=True):
+    prompt = st.text_area("Prompt", height=120,
+                          placeholder="Shiva meditating on Mount Kailash as dawn light "
+                                      "breaks through the clouds...")
+    image = st.file_uploader("Reference image (optional, video mode only)",
+                             type=["png", "jpg", "jpeg", "webp"])
+    if st.form_submit_button("Add to queue", type="primary"):
+        if prompt.strip():
+            add_job(prompt, image)
+            st.success("Job added.")
+        else:
+            st.warning("Prompt is empty.")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +641,7 @@ with left:
     st.subheader(f"Queue — {len(jobs)} job(s), {len(queued)} pending")
 with right:
     run_clicked = st.button(
-        f"🚀 Generate {len(queued) * variations} video(s)",
+        f"🚀 Generate {len(queued) * variations} {'video(s)' if is_video else 'image(s)'}",
         type="primary", use_container_width=True,
         disabled=not queued or st.session_state.running,
     )
@@ -549,14 +661,20 @@ if run_clicked:
             job["status"] = "running"
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as pool:
-            futures = {
-                pool.submit(
-                    generate_video, auth, model, job["prompt"],
-                    job["image_bytes"], job["image_mime"],
-                    int(duration_s), thinking_level,
-                ): job
-                for job, _ in work
-            }
+            def submit(job):
+                final_prompt = build_final_prompt(
+                    job["prompt"], is_video, aspect_ratio, platform, purpose,
+                    spiritual_mode, high_retention, int(duration_s))
+                job["final_prompt"] = final_prompt
+                if is_video:
+                    return pool.submit(
+                        generate_video, auth, model, final_prompt,
+                        job["image_bytes"], job["image_mime"],
+                        int(duration_s), thinking_level, aspect_ratio)
+                return pool.submit(
+                    generate_image, auth, model, final_prompt, aspect_ratio)
+
+            futures = {submit(job): job for job, _ in work}
             for fut in concurrent.futures.as_completed(futures):
                 job = futures[fut]
                 result = fut.result()
@@ -600,9 +718,9 @@ if ok_paths:
         for p in ok_paths:
             zf.write(p, arcname=Path(p).name)
     st.download_button(
-        f"⬇️ Download all {len(ok_paths)} video(s) as ZIP",
+        f"⬇️ Download all {len(ok_paths)} file(s) as ZIP",
         data=buf.getvalue(),
-        file_name=f"videos_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        file_name=f"media_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
         mime="application/zip",
     )
 
@@ -621,17 +739,24 @@ for job in jobs:
                 st.rerun()
 
         with media_col:
+            if job.get("final_prompt"):
+                with st.popover("View full prompt sent to the model"):
+                    st.text(job["final_prompt"])
             for i, result in enumerate(job.get("results") or []):
                 if result["ok"]:
-                    st.video(result["path"])
+                    is_mp4 = result["path"].endswith(".mp4")
+                    if is_mp4:
+                        st.video(result["path"])
+                    else:
+                        st.image(result["path"])
                     st.caption(f"Variation {i + 1} · {result['elapsed']:.0f}s · `{result['path']}`")
                     dl_col, drive_col = st.columns(2)
                     with dl_col:
                         st.download_button(
-                            "⬇️ Download MP4",
+                            "⬇️ Download " + ("MP4" if is_mp4 else "PNG"),
                             data=Path(result["path"]).read_bytes(),
                             file_name=Path(result["path"]).name,
-                            mime="video/mp4",
+                            mime="video/mp4" if is_mp4 else "image/png",
                             key=f"dl_{job['id']}_{i}",
                         )
                     with drive_col:
