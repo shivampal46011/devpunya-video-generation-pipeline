@@ -197,6 +197,14 @@ def extract_video_bytes(interaction) -> tuple[bytes | None, str]:
     return video_bytes, "\n".join(text_out)
 
 
+def has_adc() -> bool:
+    """Is a local gcloud application-default credential available?"""
+    import os
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).exists()
+    return (Path.home() / ".config/gcloud/application_default_credentials.json").exists()
+
+
 def make_client(auth: dict) -> genai.Client:
     """Build a Vertex AI client (bills the GCP project).
 
@@ -213,6 +221,14 @@ def make_client(auth: dict) -> genai.Client:
         from google.oauth2 import service_account
         kwargs["credentials"] = service_account.Credentials.from_service_account_info(
             sa_info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    elif not has_adc():
+        # Without this check the library probes the GCE metadata server and
+        # fails with a confusing timeout on deployed machines.
+        raise RuntimeError(
+            "No GCP credentials on this machine. Open '🔑 Credentials setup' in "
+            "the sidebar and upload a service account key JSON (create one at "
+            "GCP Console → IAM → Service Accounts with the 'Vertex AI User' "
+            "role → Keys → Add key → JSON).")
     return genai.Client(
         vertexai=True,
         project=auth["project"],
@@ -735,6 +751,10 @@ with st.sidebar:
         if SA_KEY_PATH.exists() and st.button("Remove service account key"):
             SA_KEY_PATH.unlink()
             st.rerun()
+
+    if not cred_age_ok(SA_KEY_PATH) and not _secret("gcp_service_account") and not has_adc():
+        st.warning("⚠️ No GCP credentials — generation will fail. Upload a "
+                   "service account key in **🔑 Credentials setup** above.")
 
     st.divider()
     st.subheader("☁️ Google Drive")
