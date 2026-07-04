@@ -113,6 +113,34 @@ CLIENT_SECRET_PATH = Path(__file__).parent / "client_secret.json"
 DRIVE_TOKEN_PATH = Path(__file__).parent / "drive_token.json"
 SA_KEY_PATH = Path(__file__).parent / "service_account.json"
 HISTORY_FILENAME = "pipeline_history.json"
+SETTINGS_PATH = Path(__file__).parent / "pipeline_settings.json"
+DEFAULT_FOLDER_NAME = "AI Video Generation - Gemini"
+CRED_MAX_AGE_DAYS = 90
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_settings(settings: dict):
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=1))
+
+
+def cred_age_ok(path: Path) -> bool:
+    """Credentials are kept for 90 days; older files are removed (re-link needed)."""
+    if not path.exists():
+        return False
+    if time.time() - path.stat().st_mtime > CRED_MAX_AGE_DAYS * 86400:
+        path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def cred_days_left(path: Path) -> int:
+    return max(0, int(CRED_MAX_AGE_DAYS - (time.time() - path.stat().st_mtime) / 86400))
 
 st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout="wide")
 
@@ -177,7 +205,7 @@ def make_client(auth: dict) -> genai.Client:
     """
     kwargs = {}
     sa_info = None
-    if SA_KEY_PATH.exists():
+    if cred_age_ok(SA_KEY_PATH):
         sa_info = json.loads(SA_KEY_PATH.read_text())
     elif _secret("gcp_service_account"):
         sa_info = dict(_secret("gcp_service_account"))
@@ -319,7 +347,7 @@ def get_drive_creds(interactive: bool = False):
     from google.oauth2.credentials import Credentials
 
     creds = None
-    if DRIVE_TOKEN_PATH.exists():
+    if cred_age_ok(DRIVE_TOKEN_PATH):
         try:
             creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN_PATH), DRIVE_SCOPES)
         except Exception:  # noqa: BLE001 — corrupt token file, re-auth
@@ -401,6 +429,25 @@ def drive_download_file(file_id: str, dest: Path):
     while not done:
         _, done = downloader.next_chunk()
     dest.write_bytes(buf.getvalue())
+
+
+def get_or_create_default_folder() -> str:
+    """Find (or create) the app's default Drive folder and return its id."""
+    service = get_drive_service()
+    res = service.files().list(
+        q=f"name='{DEFAULT_FOLDER_NAME}' and "
+          "mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id)", pageSize=1,
+    ).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+    created = service.files().create(
+        body={"name": DEFAULT_FOLDER_NAME,
+              "mimeType": "application/vnd.google-apps.folder"},
+        fields="id",
+    ).execute()
+    return created["id"]
 
 
 # --- Drive folder as persistent job-history DB ---
@@ -565,15 +612,15 @@ with st.sidebar:
                 st.error(f"{cf.name}: unrecognized credential format")
 
         active = []
-        if SA_KEY_PATH.exists():
-            active.append("service account ✅")
-        if CLIENT_SECRET_PATH.exists():
-            active.append("client secret ✅")
-        if DRIVE_TOKEN_PATH.exists():
-            active.append("drive token ✅")
+        for label, p in [("service account", SA_KEY_PATH),
+                         ("client secret", CLIENT_SECRET_PATH),
+                         ("drive token", DRIVE_TOKEN_PATH)]:
+            if cred_age_ok(p):
+                active.append(f"{label} ✅ ({cred_days_left(p)}d left)")
         st.caption("Stored: " + (", ".join(active) if active else "none") +
-                   " · Generation uses the service account if present, else "
-                   "your gcloud login.")
+                   f" · Credentials are kept for {CRED_MAX_AGE_DAYS} days, then "
+                   "removed automatically. Generation uses the service account "
+                   "if present, else your gcloud login.")
         if SA_KEY_PATH.exists() and st.button("Remove service account key"):
             SA_KEY_PATH.unlink()
             st.rerun()
@@ -641,18 +688,36 @@ with st.sidebar:
                 drive_enabled = False
         else:
             try:
-                folders = list_drive_folders()
-                options = {"My Drive (root)": "root"}
-                options.update({f["name"]: f["id"] for f in folders})
-                chosen = st.selectbox("Drive folder", list(options.keys()))
-                drive_folder_id = options[chosen]
-                custom = st.text_input(
-                    "…or paste a folder link / ID (overrides the picker)",
-                    placeholder="https://drive.google.com/drive/folders/…",
-                )
-                if custom.strip():
-                    drive_folder_id = parse_drive_folder_id(custom)
-                st.caption(f"Uploading to folder ID: `{drive_folder_id}`")
+                settings = load_settings()
+                drive_folder_id = settings.get("drive_folder_id")
+                if not drive_folder_id:
+                    drive_folder_id = get_or_create_default_folder()
+                    settings["drive_folder_id"] = drive_folder_id
+                    settings["drive_folder_name"] = DEFAULT_FOLDER_NAME
+                    save_settings(settings)
+                folder_name = settings.get("drive_folder_name", DEFAULT_FOLDER_NAME)
+                st.caption(f"Folder: **{folder_name}**")
+
+                with st.expander("Change folder"):
+                    folders = list_drive_folders()
+                    options = {"My Drive (root)": "root"}
+                    options.update({f["name"]: f["id"] for f in folders})
+                    chosen = st.selectbox("Drive folder", list(options.keys()))
+                    custom = st.text_input(
+                        "…or paste a folder link / ID (overrides the picker)",
+                        placeholder="https://drive.google.com/drive/folders/…",
+                    )
+                    if st.button("Use this folder", use_container_width=True):
+                        if custom.strip():
+                            settings["drive_folder_id"] = parse_drive_folder_id(custom)
+                            settings["drive_folder_name"] = "custom folder"
+                        else:
+                            settings["drive_folder_id"] = options[chosen]
+                            settings["drive_folder_name"] = chosen
+                        save_settings(settings)
+                        st.session_state.history_synced = False
+                        st.rerun()
+
                 if st.button("↻ Sync history with Drive", use_container_width=True,
                              help="Merges the history saved in this Drive folder with "
                                   "the current session, then saves it back."):
