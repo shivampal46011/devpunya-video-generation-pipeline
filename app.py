@@ -11,8 +11,8 @@ Run:
 """
 
 import base64
-import concurrent.futures
 import json
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -453,7 +453,7 @@ def get_or_create_default_folder() -> str:
 # --- Drive folder as persistent job-history DB ---
 
 def _serialize_job(job: dict) -> dict:
-    return {k: v for k, v in job.items() if k != "image_bytes"}
+    return {k: v for k, v in job.items() if k not in ("image_bytes", "image_b64")}
 
 
 def _find_history_file(service, folder_id: str):
@@ -492,8 +492,14 @@ def drive_load_history(folder_id: str) -> list:
     content = service.files().get_media(fileId=file_id).execute()
     jobs = json.loads(content)
     for j in jobs:
-        j["image_bytes"] = None
+        j["image_b64"] = None
         j.setdefault("image_mime", None)
+        j.setdefault("results", [])
+        j.setdefault("variations", 1)
+        j.setdefault("mode", "video")
+        # Restored jobs from another machine are display-only, never re-run.
+        if j.get("status") in ("queued", "running"):
+            j["status"] = "done" if j.get("results") else "failed"
     return jobs
 
 
@@ -510,28 +516,134 @@ choose **External**, fill the required fields, and add your own email under **Te
 
 
 # ---------------------------------------------------------------------------
-# Session state
+# Persistent job store + background worker
+#
+# Jobs live in a server-side store (survives page refreshes) backed by a
+# local JSON DB (survives server restarts) and mirrored to Drive history.
+# A daemon worker thread processes the queue; the page only renders state.
 # ---------------------------------------------------------------------------
 
-if "jobs" not in st.session_state:
-    # each job: {id, prompt, image_name, image_bytes, image_mime,
-    #            status: queued|running|done|failed, result}
-    st.session_state.jobs = []
-if "running" not in st.session_state:
-    st.session_state.running = False
+JOBS_DB_PATH = OUTPUT_DIR / "jobs_db.json"
+
+
+def load_jobs_db() -> list:
+    try:
+        jobs = json.loads(JOBS_DB_PATH.read_text())
+    except Exception:  # noqa: BLE001 — first run / corrupt db
+        return []
+    for j in jobs:
+        if j.get("status") == "running":
+            j["status"] = "queued"  # resume work interrupted by a restart
+    return jobs
+
+
+def save_jobs_db(store):
+    with store["lock"]:
+        JOBS_DB_PATH.write_text(json.dumps(store["jobs"], indent=1))
+
+
+def _job_image(job):
+    return base64.b64decode(job["image_b64"]) if job.get("image_b64") else None
+
+
+def process_job(store, job):
+    """Full lifecycle for one job: generate all variations → upload → record."""
+    while len(job["results"]) < job.get("variations", 1):
+        if job["mode"] == "video":
+            result = generate_video(
+                job["auth"], job["model"], job["final_prompt"],
+                _job_image(job), job.get("image_mime"),
+                job.get("duration_s") or 12, job.get("thinking_level", "medium"),
+                job.get("aspect_ratio", "9:16"))
+        else:
+            result = generate_image(
+                job["auth"], job["model"], job["final_prompt"],
+                job.get("aspect_ratio", "9:16"))
+
+        if result["ok"] and job.get("drive_upload"):
+            folder = load_settings().get("drive_folder_id")
+            if folder and get_drive_creds():
+                try:
+                    up = upload_to_drive(result["path"], folder)
+                    result["drive_link"] = up["link"]
+                    result["drive_id"] = up["id"]
+                except Exception as e:  # noqa: BLE001
+                    result["drive_error"] = str(e)[:200]
+
+        with store["lock"]:
+            job["results"].append(result)
+        save_jobs_db(store)
+
+    job["status"] = "done" if any(r["ok"] for r in job["results"]) else "failed"
+    save_jobs_db(store)
+
+    folder = load_settings().get("drive_folder_id")
+    if job.get("drive_upload") and folder:
+        try:
+            drive_save_history(folder, store["jobs"])
+        except Exception:  # noqa: BLE001 — history mirror is best-effort
+            pass
+
+
+def worker_loop(store):
+    while True:
+        job = None
+        with store["lock"]:
+            for j in store["jobs"]:
+                if j["status"] == "queued":
+                    j["status"] = "running"
+                    job = j
+                    break
+        if job is None:
+            time.sleep(2)
+            continue
+        try:
+            process_job(store, job)
+        except Exception as e:  # noqa: BLE001 — job must never kill the worker
+            job["status"] = "failed"
+            job["error"] = str(e)[:300]
+            save_jobs_db(store)
+
+
+@st.cache_resource
+def get_store():
+    store = {"lock": threading.RLock(), "jobs": load_jobs_db()}
+    worker = threading.Thread(target=worker_loop, args=(store,), daemon=True)
+    worker.start()
+    store["worker"] = worker
+    return store
+
+
+store = get_store()
 
 
 def add_job(prompt: str, image_file=None):
+    """Snapshot ALL current settings into the job — the full request body."""
     job = {
         "id": uuid.uuid4().hex[:8],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
         "prompt": prompt.strip(),
+        "final_prompt": build_final_prompt(
+            prompt, is_video, aspect_ratio, platform, purpose,
+            spiritual_mode, high_retention, int(duration_s)),
+        "mode": "video" if is_video else "image",
+        "model": model,
+        "aspect_ratio": aspect_ratio,
+        "duration_s": int(duration_s),
+        "thinking_level": thinking_level,
+        "variations": int(variations),
+        "auth": dict(auth),
+        "drive_upload": bool(drive_enabled and drive_folder_id),
         "image_name": image_file.name if image_file else None,
-        "image_bytes": image_file.getvalue() if image_file else None,
+        "image_b64": base64.b64encode(image_file.getvalue()).decode()
+                     if image_file else None,
         "image_mime": image_file.type if image_file else None,
         "status": "queued",
-        "result": None,
+        "results": [],
     }
-    st.session_state.jobs.append(job)
+    with store["lock"]:
+        store["jobs"].append(job)
+    save_jobs_db(store)
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +680,9 @@ with st.sidebar:
         duration_s = 0
     thinking_level = st.selectbox("Thinking level", ["high", "medium", "low"], index=1)
     variations = st.number_input("Variations per prompt", 1, 5, 1,
-                                 help="Generate N outputs for each prompt.")
-    max_workers = st.slider("Parallel generations", 1, 4, 1,
-                            help="Keep at 1 unless your Vertex per-minute quota "
-                                 "allows more — parallel requests hit 429s.")
+                                 help="Generate N outputs for each prompt. The "
+                                      "background worker processes them one at a "
+                                      "time (avoids per-minute quota 429s).")
 
     st.divider()
     st.subheader("🎯 Content style")
@@ -733,8 +844,11 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"Output folder: `{OUTPUT_DIR}`")
-    if st.button("🗑️ Clear all jobs", use_container_width=True):
-        st.session_state.jobs = []
+    if st.button("🗑️ Clear finished jobs", use_container_width=True):
+        with store["lock"]:
+            store["jobs"][:] = [j for j in store["jobs"]
+                                if j["status"] in ("queued", "running")]
+        save_jobs_db(store)
         st.rerun()
 
 
@@ -749,10 +863,12 @@ st.caption("Queue text + image prompts, then batch-generate videos with Gemini."
 if drive_enabled and drive_folder_id and not st.session_state.get("history_synced"):
     try:
         loaded = drive_load_history(drive_folder_id)
-        existing_ids = {j["id"] for j in st.session_state.jobs}
-        restored = [j for j in loaded if j["id"] not in existing_ids]
-        st.session_state.jobs = restored + st.session_state.jobs
-        drive_save_history(drive_folder_id, st.session_state.jobs)
+        with store["lock"]:
+            existing_ids = {j["id"] for j in store["jobs"]}
+            restored = [j for j in loaded if j["id"] not in existing_ids]
+            store["jobs"][:] = restored + store["jobs"]
+        save_jobs_db(store)
+        drive_save_history(drive_folder_id, store["jobs"])
         st.session_state.history_synced = True
         if restored:
             st.toast(f"Restored {len(restored)} job(s) from Drive history.")
@@ -778,81 +894,16 @@ with st.form("single_job", clear_on_submit=True):
 # ---------------------------------------------------------------------------
 
 st.divider()
-jobs = st.session_state.jobs
+with store["lock"]:
+    jobs = list(store["jobs"])
 queued = [j for j in jobs if j["status"] == "queued"]
+running = [j for j in jobs if j["status"] == "running"]
 
-left, right = st.columns([3, 1])
-with left:
-    st.subheader(f"Queue — {len(jobs)} job(s), {len(queued)} pending")
-with right:
-    run_clicked = st.button(
-        f"🚀 Generate {len(queued) * variations} {'video(s)' if is_video else 'image(s)'}",
-        type="primary", use_container_width=True,
-        disabled=not queued or st.session_state.running,
-    )
-
-if run_clicked:
-    if not auth["project"]:
-        st.error("No GCP project ID — enter one in the sidebar.")
-    else:
-        st.session_state.running = True
-
-        # Expand queued jobs by requested variation count.
-        work = [(job, v) for job in queued for v in range(int(variations))]
-        progress = st.progress(0.0, text="Starting…")
-        done_count = 0
-
-        for job, _ in work:
-            job["status"] = "running"
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as pool:
-            def submit(job):
-                final_prompt = build_final_prompt(
-                    job["prompt"], is_video, aspect_ratio, platform, purpose,
-                    spiritual_mode, high_retention, int(duration_s))
-                job["final_prompt"] = final_prompt
-                if is_video:
-                    return pool.submit(
-                        generate_video, auth, model, final_prompt,
-                        job["image_bytes"], job["image_mime"],
-                        int(duration_s), thinking_level, aspect_ratio)
-                return pool.submit(
-                    generate_image, auth, model, final_prompt, aspect_ratio)
-
-            futures = {submit(job): job for job, _ in work}
-            for fut in concurrent.futures.as_completed(futures):
-                job = futures[fut]
-                result = fut.result()
-                done_count += 1
-                # A job may have several variations; collect all results.
-                job.setdefault("results", []).append(result)
-                if len(job.get("results", [])) >= int(variations):
-                    job["status"] = "done" if any(r["ok"] for r in job["results"]) else "failed"
-                progress.progress(
-                    done_count / len(work),
-                    text=f"Generated {done_count}/{len(work)} — last: "
-                         f"{'✅ ok' if result['ok'] else '❌ ' + str(result['error'])[:80]}",
-                )
-
-        # Auto-upload the new videos to the chosen Drive folder.
-        if drive_enabled and drive_folder_id:
-            uploads = [r for job, _ in work for r in job.get("results", [])
-                       if r["ok"] and not r.get("drive_link")]
-            for k, result in enumerate(uploads, 1):
-                progress.progress(1.0, text=f"Uploading to Drive {k}/{len(uploads)}…")
-                try:
-                    up = upload_to_drive(result["path"], drive_folder_id)
-                    result["drive_link"] = up["link"]
-                    result["drive_id"] = up["id"]
-                except Exception as e:  # noqa: BLE001
-                    result["drive_error"] = str(e)[:200]
-            try:
-                drive_save_history(drive_folder_id, st.session_state.jobs)
-            except Exception:  # noqa: BLE001 — history save is best-effort
-                pass
-
-        st.session_state.running = False
-        st.rerun()
+st.subheader(f"Queue — {len(jobs)} job(s) · {len(queued)} queued · "
+             f"{len(running)} running")
+st.caption("Jobs process automatically in the background — you can refresh or "
+           "close this page without losing progress. Results and Drive uploads "
+           "appear here as each variation finishes.")
 
 
 # ---------------------------------------------------------------------------
@@ -877,16 +928,35 @@ if ok_paths:
 
 for job in jobs:
     icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}[job["status"]]
-    with st.expander(f"{icon} [{job['status']}] {job['prompt'][:90]}", expanded=job["status"] == "done"):
+    kind_icon = "🎬" if job.get("mode", "video") == "video" else "🖼️"
+    with st.expander(f"{icon} {kind_icon} [{job['status']}] {job['prompt'][:90]}",
+                     expanded=job["status"] in ("done", "running")):
+        if job["status"] == "running":
+            done_n = len(job.get("results") or [])
+            total_n = max(job.get("variations", 1), 1)
+            st.progress(min(done_n / total_n, 0.95),
+                        text=f"Generating variation {min(done_n + 1, total_n)}/{total_n}…")
+        if job["status"] == "failed" and job.get("error"):
+            st.error(job["error"])
         meta_col, media_col = st.columns([1, 2])
         with meta_col:
             st.write(f"**Job ID:** `{job['id']}`")
-            if job["image_bytes"]:
-                st.image(job["image_bytes"], caption=job["image_name"], width=220)
+            st.caption(f"{job.get('mode', 'video')} · {job.get('model', '?')} · "
+                       f"{job.get('aspect_ratio', '?')}"
+                       + (f" · {job.get('duration_s')}s" if job.get("mode") == "video" else "")
+                       + f" · {job.get('variations', 1)} variation(s)"
+                       + (" · ☁️ Drive" if job.get("drive_upload") else ""))
+            if job.get("image_b64"):
+                st.image(base64.b64decode(job["image_b64"]),
+                         caption=job.get("image_name"), width=220)
             else:
-                st.caption("No reference image (text-to-video).")
-            if st.button("Remove", key=f"rm_{job['id']}"):
-                st.session_state.jobs = [j for j in st.session_state.jobs if j["id"] != job["id"]]
+                st.caption("No reference image.")
+            if st.button("Remove", key=f"rm_{job['id']}",
+                         disabled=job["status"] == "running"):
+                with store["lock"]:
+                    store["jobs"][:] = [j for j in store["jobs"]
+                                        if j["id"] != job["id"]]
+                save_jobs_db(store)
                 st.rerun()
 
         with media_col:
@@ -922,6 +992,7 @@ for job in jobs:
                                 try:
                                     drive_download_file(result["drive_id"], dest)
                                     result["path"] = str(dest)
+                                    save_jobs_db(store)
                                 except Exception as e:  # noqa: BLE001
                                     st.error(f"Fetch failed: {str(e)[:150]}")
                                 st.rerun()
@@ -938,8 +1009,8 @@ for job in jobs:
                                     up = upload_to_drive(result["path"], drive_folder_id)
                                     result["drive_link"] = up["link"]
                                     result["drive_id"] = up["id"]
-                                    drive_save_history(drive_folder_id,
-                                                       st.session_state.jobs)
+                                    save_jobs_db(store)
+                                    drive_save_history(drive_folder_id, store["jobs"])
                                 except Exception as e:  # noqa: BLE001
                                     result["drive_error"] = str(e)[:200]
                                 st.rerun()
@@ -947,3 +1018,11 @@ for job in jobs:
                         st.caption(f"Model notes: {result['text'][:300]}")
                 else:
                     st.error(f"Variation {i + 1} failed: {result['error']}")
+
+# ---------------------------------------------------------------------------
+# Live refresh while the background worker is busy
+# ---------------------------------------------------------------------------
+
+if any(j["status"] in ("queued", "running") for j in jobs):
+    time.sleep(3)
+    st.rerun()
