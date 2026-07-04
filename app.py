@@ -112,6 +112,7 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 CLIENT_SECRET_PATH = Path(__file__).parent / "client_secret.json"
 DRIVE_TOKEN_PATH = Path(__file__).parent / "drive_token.json"
 SA_KEY_PATH = Path(__file__).parent / "service_account.json"
+HISTORY_FILENAME = "pipeline_history.json"
 
 st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout="wide")
 
@@ -375,8 +376,8 @@ def parse_drive_folder_id(text: str) -> str:
     return text.split("?")[0].split("/")[0]
 
 
-def upload_to_drive(path: str, folder_id: str) -> str:
-    """Upload one video to Drive; returns the webViewLink."""
+def upload_to_drive(path: str, folder_id: str) -> dict:
+    """Upload one media file to Drive; returns {id, link}."""
     from googleapiclient.http import MediaFileUpload
     service = get_drive_service()
     mime = "video/mp4" if path.endswith(".mp4") else "image/png"
@@ -386,7 +387,67 @@ def upload_to_drive(path: str, folder_id: str) -> str:
         body=meta, media_body=media, fields="id, webViewLink",
         supportsAllDrives=True,
     ).execute()
-    return created["webViewLink"]
+    return {"id": created["id"], "link": created["webViewLink"]}
+
+
+def drive_download_file(file_id: str, dest: Path):
+    """Download a Drive file to a local path (restore media for preview)."""
+    import io as _io
+    from googleapiclient.http import MediaIoBaseDownload
+    request = get_drive_service().files().get_media(fileId=file_id)
+    buf = _io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    dest.write_bytes(buf.getvalue())
+
+
+# --- Drive folder as persistent job-history DB ---
+
+def _serialize_job(job: dict) -> dict:
+    return {k: v for k, v in job.items() if k != "image_bytes"}
+
+
+def _find_history_file(service, folder_id: str):
+    res = service.files().list(
+        q=f"name='{HISTORY_FILENAME}' and '{folder_id}' in parents and trashed=false",
+        fields="files(id)", pageSize=1, supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def drive_save_history(folder_id: str, jobs: list):
+    """Write the job history JSON into the Drive folder (create or update)."""
+    from googleapiclient.http import MediaInMemoryUpload
+    service = get_drive_service()
+    payload = json.dumps([_serialize_job(j) for j in jobs], indent=1).encode()
+    media = MediaInMemoryUpload(payload, mimetype="application/json")
+    file_id = _find_history_file(service, folder_id)
+    if file_id:
+        service.files().update(fileId=file_id, media_body=media,
+                               supportsAllDrives=True).execute()
+    else:
+        service.files().create(
+            body={"name": HISTORY_FILENAME, "parents": [folder_id]},
+            media_body=media, supportsAllDrives=True,
+        ).execute()
+
+
+def drive_load_history(folder_id: str) -> list:
+    """Read the job history JSON from the Drive folder ([] if none yet)."""
+    service = get_drive_service()
+    file_id = _find_history_file(service, folder_id)
+    if not file_id:
+        return []
+    content = service.files().get_media(fileId=file_id).execute()
+    jobs = json.loads(content)
+    for j in jobs:
+        j["image_bytes"] = None
+        j.setdefault("image_mime", None)
+    return jobs
 
 
 DRIVE_SETUP_HELP = f"""\
@@ -592,6 +653,11 @@ with st.sidebar:
                 if custom.strip():
                     drive_folder_id = parse_drive_folder_id(custom)
                 st.caption(f"Uploading to folder ID: `{drive_folder_id}`")
+                if st.button("↻ Sync history with Drive", use_container_width=True,
+                             help="Merges the history saved in this Drive folder with "
+                                  "the current session, then saves it back."):
+                    st.session_state.history_synced = False
+                    st.rerun()
                 if st.button("Unlink Drive"):
                     DRIVE_TOKEN_PATH.unlink(missing_ok=True)
                     st.cache_data.clear()
@@ -613,6 +679,20 @@ with st.sidebar:
 
 st.title("🎬 Automated Video Content Pipeline")
 st.caption("Queue text + image prompts, then batch-generate videos with Gemini.")
+
+# The Drive folder doubles as a persistent history DB: load it once per session.
+if drive_enabled and drive_folder_id and not st.session_state.get("history_synced"):
+    try:
+        loaded = drive_load_history(drive_folder_id)
+        existing_ids = {j["id"] for j in st.session_state.jobs}
+        restored = [j for j in loaded if j["id"] not in existing_ids]
+        st.session_state.jobs = restored + st.session_state.jobs
+        drive_save_history(drive_folder_id, st.session_state.jobs)
+        st.session_state.history_synced = True
+        if restored:
+            st.toast(f"Restored {len(restored)} job(s) from Drive history.")
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Could not sync Drive history: {str(e)[:150]}")
 
 with st.form("single_job", clear_on_submit=True):
     prompt = st.text_area("Prompt", height=120,
@@ -696,9 +776,15 @@ if run_clicked:
             for k, result in enumerate(uploads, 1):
                 progress.progress(1.0, text=f"Uploading to Drive {k}/{len(uploads)}…")
                 try:
-                    result["drive_link"] = upload_to_drive(result["path"], drive_folder_id)
+                    up = upload_to_drive(result["path"], drive_folder_id)
+                    result["drive_link"] = up["link"]
+                    result["drive_id"] = up["id"]
                 except Exception as e:  # noqa: BLE001
                     result["drive_error"] = str(e)[:200]
+            try:
+                drive_save_history(drive_folder_id, st.session_state.jobs)
+            except Exception:  # noqa: BLE001 — history save is best-effort
+                pass
 
         st.session_state.running = False
         st.rerun()
@@ -744,21 +830,38 @@ for job in jobs:
                     st.text(job["final_prompt"])
             for i, result in enumerate(job.get("results") or []):
                 if result["ok"]:
-                    is_mp4 = result["path"].endswith(".mp4")
-                    if is_mp4:
-                        st.video(result["path"])
-                    else:
-                        st.image(result["path"])
-                    st.caption(f"Variation {i + 1} · {result['elapsed']:.0f}s · `{result['path']}`")
+                    is_mp4 = (result.get("path") or "").endswith(".mp4")
+                    has_local = result.get("path") and Path(result["path"]).exists()
+                    if has_local:
+                        if is_mp4:
+                            st.video(result["path"])
+                        else:
+                            st.image(result["path"])
+                    st.caption(f"Variation {i + 1} · {result.get('elapsed') or 0:.0f}s "
+                               f"· `{result.get('path')}`")
                     dl_col, drive_col = st.columns(2)
                     with dl_col:
-                        st.download_button(
-                            "⬇️ Download " + ("MP4" if is_mp4 else "PNG"),
-                            data=Path(result["path"]).read_bytes(),
-                            file_name=Path(result["path"]).name,
-                            mime="video/mp4" if is_mp4 else "image/png",
-                            key=f"dl_{job['id']}_{i}",
-                        )
+                        if has_local:
+                            st.download_button(
+                                "⬇️ Download " + ("MP4" if is_mp4 else "PNG"),
+                                data=Path(result["path"]).read_bytes(),
+                                file_name=Path(result["path"]).name,
+                                mime="video/mp4" if is_mp4 else "image/png",
+                                key=f"dl_{job['id']}_{i}",
+                            )
+                        elif result.get("drive_id"):
+                            if st.button("⤵️ Fetch from Drive", key=f"fetch_{job['id']}_{i}",
+                                         help="Restores this file locally for preview "
+                                              "and download."):
+                                dest = OUTPUT_DIR / Path(result["path"]).name
+                                try:
+                                    drive_download_file(result["drive_id"], dest)
+                                    result["path"] = str(dest)
+                                except Exception as e:  # noqa: BLE001
+                                    st.error(f"Fetch failed: {str(e)[:150]}")
+                                st.rerun()
+                        else:
+                            st.caption("File not on this machine.")
                     with drive_col:
                         if result.get("drive_link"):
                             st.link_button("☁️ View on Drive", result["drive_link"])
@@ -767,8 +870,11 @@ for job in jobs:
                         elif drive_enabled and drive_folder_id:
                             if st.button("☁️ Upload to Drive", key=f"up_{job['id']}_{i}"):
                                 try:
-                                    result["drive_link"] = upload_to_drive(
-                                        result["path"], drive_folder_id)
+                                    up = upload_to_drive(result["path"], drive_folder_id)
+                                    result["drive_link"] = up["link"]
+                                    result["drive_id"] = up["id"]
+                                    drive_save_history(drive_folder_id,
+                                                       st.session_state.jobs)
                                 except Exception as e:  # noqa: BLE001
                                     result["drive_error"] = str(e)[:200]
                                 st.rerun()
