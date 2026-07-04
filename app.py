@@ -447,6 +447,47 @@ def drive_download_file(file_id: str, dest: Path):
     dest.write_bytes(buf.getvalue())
 
 
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=64)
+def fetch_drive_bytes(drive_id: str) -> bytes:
+    """Drive is the source of truth: media is streamed from it for preview."""
+    import io as _io
+    from googleapiclient.http import MediaIoBaseDownload
+    request = get_drive_service().files().get_media(fileId=drive_id)
+    buf = _io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def result_bytes(result: dict) -> bytes | None:
+    """Media bytes for a result — from Drive first, local file as fallback."""
+    if result.get("drive_id"):
+        try:
+            return fetch_drive_bytes(result["drive_id"])
+        except Exception:  # noqa: BLE001
+            pass
+    p = result.get("path")
+    if p and Path(p).exists():
+        return Path(p).read_bytes()
+    return None
+
+
+def upload_result_to_drive(result: dict, folder_id: str):
+    """Move a generated file to Drive: upload, then remove the local copy."""
+    up = upload_to_drive(result["path"], folder_id)
+    result["drive_link"] = up["link"]
+    result["drive_id"] = up["id"]
+    try:
+        p = Path(result["path"])
+        if p.exists():
+            p.unlink()
+        result["path"] = p.name  # keep only the filename for display/downloads
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def get_or_create_default_folder() -> str:
     """Find (or create) the app's default Drive folder and return its id."""
     service = get_drive_service()
@@ -580,9 +621,7 @@ def process_job(store, job):
             folder = load_settings().get("drive_folder_id")
             if folder and get_drive_creds():
                 try:
-                    up = upload_to_drive(result["path"], folder)
-                    result["drive_link"] = up["link"]
-                    result["drive_id"] = up["id"]
+                    upload_result_to_drive(result, folder)
                 except Exception as e:  # noqa: BLE001
                     result["drive_error"] = str(e)[:200]
 
@@ -935,17 +974,22 @@ st.caption("Jobs process automatically in the background — you can refresh or 
 # Results
 # ---------------------------------------------------------------------------
 
-ok_paths = [r["path"] for j in jobs for r in j.get("results") or []
-            if r["ok"] and Path(r["path"]).exists()]
-if ok_paths:
+ok_results = [r for j in jobs for r in j.get("results") or [] if r["ok"]]
+if ok_results and st.toggle("Prepare ZIP of all files", value=False,
+                            help="Streams every file from Drive and bundles "
+                                 "them into one download."):
     import io
     import zipfile
     buf = io.BytesIO()
+    added = 0
     with zipfile.ZipFile(buf, "w") as zf:
-        for p in ok_paths:
-            zf.write(p, arcname=Path(p).name)
+        for r in ok_results:
+            data = result_bytes(r)
+            if data:
+                zf.writestr(Path(r["path"]).name, data)
+                added += 1
     st.download_button(
-        f"⬇️ Download all {len(ok_paths)} file(s) as ZIP",
+        f"⬇️ Download all {added} file(s) as ZIP",
         data=buf.getvalue(),
         file_name=f"media_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
         mime="application/zip",
@@ -991,38 +1035,27 @@ for job in jobs:
             for i, result in enumerate(job.get("results") or []):
                 if result["ok"]:
                     is_mp4 = (result.get("path") or "").endswith(".mp4")
-                    has_local = result.get("path") and Path(result["path"]).exists()
-                    if has_local:
+                    data = result_bytes(result)
+                    if data:
                         if is_mp4:
-                            st.video(result["path"])
+                            st.video(data)
                         else:
-                            st.image(result["path"])
+                            st.image(data)
+                    else:
+                        st.caption("Media unavailable — not on Drive and no local copy.")
+                    src = "☁️ Drive" if result.get("drive_id") else "local"
                     st.caption(f"Variation {i + 1} · {result.get('elapsed') or 0:.0f}s "
-                               f"· `{result.get('path')}`")
+                               f"· {Path(result.get('path') or '?').name} · {src}")
                     dl_col, drive_col = st.columns(2)
                     with dl_col:
-                        if has_local:
+                        if data:
                             st.download_button(
                                 "⬇️ Download " + ("MP4" if is_mp4 else "PNG"),
-                                data=Path(result["path"]).read_bytes(),
+                                data=data,
                                 file_name=Path(result["path"]).name,
                                 mime="video/mp4" if is_mp4 else "image/png",
                                 key=f"dl_{job['id']}_{i}",
                             )
-                        elif result.get("drive_id"):
-                            if st.button("⤵️ Fetch from Drive", key=f"fetch_{job['id']}_{i}",
-                                         help="Restores this file locally for preview "
-                                              "and download."):
-                                dest = OUTPUT_DIR / Path(result["path"]).name
-                                try:
-                                    drive_download_file(result["drive_id"], dest)
-                                    result["path"] = str(dest)
-                                    save_jobs_db(store)
-                                except Exception as e:  # noqa: BLE001
-                                    st.error(f"Fetch failed: {str(e)[:150]}")
-                                st.rerun()
-                        else:
-                            st.caption("File not on this machine.")
                     with drive_col:
                         if result.get("drive_link"):
                             st.link_button("☁️ View on Drive", result["drive_link"])
@@ -1031,9 +1064,7 @@ for job in jobs:
                         elif drive_enabled and drive_folder_id:
                             if st.button("☁️ Upload to Drive", key=f"up_{job['id']}_{i}"):
                                 try:
-                                    up = upload_to_drive(result["path"], drive_folder_id)
-                                    result["drive_link"] = up["link"]
-                                    result["drive_id"] = up["id"]
+                                    upload_result_to_drive(result, drive_folder_id)
                                     save_jobs_db(store)
                                     drive_save_history(drive_folder_id, store["jobs"])
                                 except Exception as e:  # noqa: BLE001
