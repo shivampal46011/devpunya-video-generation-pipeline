@@ -97,9 +97,9 @@ def build_final_prompt(user_prompt: str, is_video: bool, aspect_ratio: str,
     """Layer the style directives onto the user's prompt."""
     parts = [user_prompt.strip()]
     if spiritual:
-        parts.append(SPIRITUAL_DIRECTIVE)
+        parts.append(get_prompt("spiritual_directive"))
     if high_retention:
-        parts.append(HOOK_DIRECTIVE_VIDEO if is_video else HOOK_DIRECTIVE_IMAGE)
+        parts.append(get_prompt("hook_video" if is_video else "hook_image"))
     if platform in PLATFORM_GUIDELINES:
         parts.append(PLATFORM_GUIDELINES[platform])
     if purpose in PURPOSE_GUIDELINES:
@@ -142,6 +142,43 @@ def cred_age_ok(path: Path) -> bool:
 
 def cred_days_left(path: Path) -> int:
     return max(0, int(CRED_MAX_AGE_DAYS - (time.time() - path.stat().st_mtime) / 86400))
+
+
+# ---------------------------------------------------------------------------
+# Editable system prompts — defaults live here; overrides in settings
+# ---------------------------------------------------------------------------
+
+AGENT1_CORE_DEFAULT = """YOUR 2 CORE OBJECTIVES — every creative decision serves them:
+1. EXTREMELY HIGH HOOK RATE — frame 1 must stop the scroll within 1.5 seconds.
+2. EXTREMELY HIGH VIEW-THROUGH RATE — every frame must end on a pull that forces the
+   viewer into the next frame; the final frame delivers the emotional payoff.
+
+MANDATORY CONSISTENCY RULES (apply across ALL frames):
+1. Tone/theme must be IDENTICAL in every frame.
+2. Personas/characters: define every character ONCE in the style bible (age, face, hair,
+   clothing, build) and reuse those exact descriptions in every frame they appear in.
+3. Continuity: each frame must begin exactly where the previous frame ended — state it.
+4. Visual style, color grade and lighting language must be the same in every frame."""
+
+AGENT2_CORE_DEFAULT = """Rules for the prompt you write:
+- Re-state every visible character with their FULL locked description from the style bible.
+- Open mid-action (no fade-ins, no dead air) and escalate visual interest every 2-3 seconds.
+- End on a moment that flows seamlessly into the next frame.
+- Specify camera, lighting, color grade and mood explicitly, matching the style bible.
+- Do NOT mention audio, narration, subtitles or text overlays."""
+
+DEFAULT_PROMPTS = {
+    "spiritual_directive": SPIRITUAL_DIRECTIVE,
+    "hook_video": HOOK_DIRECTIVE_VIDEO,
+    "hook_image": HOOK_DIRECTIVE_IMAGE,
+    "agent1_core": AGENT1_CORE_DEFAULT,
+    "agent2_core": AGENT2_CORE_DEFAULT,
+}
+
+
+def get_prompt(key: str) -> str:
+    """Effective prompt text: user override from settings, else the default."""
+    return (load_settings().get("prompts") or {}).get(key) or DEFAULT_PROMPTS[key]
 
 st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout="wide")
 
@@ -611,22 +648,111 @@ def fetch_elevenlabs_voices(api_key: str) -> list:
     return r.json().get("voices", [])
 
 
-def elevenlabs_tts(api_key: str, voice_id: str, text: str, out_path: Path):
-    """Generate the narration MP3 (Indian Hindi voice picked by the user)."""
+ELEVENLABS_TTS_TS_URL = ("https://api.elevenlabs.io/v1/text-to-speech/"
+                         "{voice_id}/with-timestamps")
+
+
+def elevenlabs_tts(api_key: str, voice_id: str, text: str, out_path: Path) -> dict | None:
+    """Generate the narration MP3. Uses the with-timestamps endpoint so we get
+    character-level timing (returned as the alignment dict); falls back to the
+    plain endpoint (returns None) if timestamps are unavailable."""
     import requests
-    r = requests.post(
-        ELEVENLABS_TTS_URL.format(voice_id=voice_id),
-        headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-        json={
-            "text": text,
-            "model_id": ELEVENLABS_TTS_MODEL,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-        },
-        timeout=300,
-    )
+    payload = {
+        "text": text,
+        "model_id": ELEVENLABS_TTS_MODEL,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
+    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+    r = requests.post(ELEVENLABS_TTS_TS_URL.format(voice_id=voice_id),
+                      headers=headers, json=payload, timeout=300)
+    if r.status_code == 200:
+        data = r.json()
+        out_path.write_bytes(base64.b64decode(data["audio_base64"]))
+        return data.get("alignment") or data.get("normalized_alignment")
+    r = requests.post(ELEVENLABS_TTS_URL.format(voice_id=voice_id),
+                      headers=headers, json=payload, timeout=300)
     if r.status_code != 200:
         raise RuntimeError(f"ElevenLabs TTS failed ({r.status_code}): {r.text[:300]}")
     out_path.write_bytes(r.content)
+    return None
+
+
+SENTENCE_ENDERS = "।॥.!?\n"
+
+
+def build_scenes(alignment: dict, audio_len: float) -> list:
+    """Chunk the narration into scenes using the TTS character timestamps.
+
+    Sentences (split on Hindi/Latin sentence enders) are grouped into scenes of
+    at most MAX_CLIP_SECONDS; overlong sentences are split at word boundaries.
+    Scenes tile the audio exactly (pauses attach to the preceding scene), so
+    each scene knows the precise [start, end] of the narration it covers."""
+    chars = alignment.get("characters") or []
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    if not chars or len(chars) != len(starts) or len(chars) != len(ends):
+        return []
+
+    sentences, buf, t0 = [], [], None
+    for ch, s, e in zip(chars, starts, ends):
+        if t0 is None:
+            t0 = s
+        buf.append(ch)
+        if ch in SENTENCE_ENDERS:
+            text = "".join(buf).strip()
+            if text:
+                sentences.append({"text": text, "start": t0, "end": e})
+            buf, t0 = [], None
+    if buf:
+        text = "".join(buf).strip()
+        if text:
+            sentences.append({"text": text, "start": t0, "end": ends[-1]})
+    if not sentences:
+        return []
+
+    # Split any single sentence longer than one clip at word boundaries.
+    pieces = []
+    for s in sentences:
+        dur = s["end"] - s["start"]
+        if dur <= MAX_CLIP_SECONDS:
+            pieces.append(s)
+            continue
+        parts = max(2, math.ceil(dur / MAX_CLIP_SECONDS))
+        words = s["text"].split()
+        per = max(1, math.ceil(len(words) / parts))
+        seg = dur / parts
+        for k in range(parts):
+            wtext = " ".join(words[k * per:(k + 1) * per]).strip()
+            if wtext:
+                pieces.append({"text": wtext,
+                               "start": s["start"] + k * seg,
+                               "end": min(s["end"], s["start"] + (k + 1) * seg)})
+
+    # Group consecutive pieces into scenes of at most MAX_CLIP_SECONDS.
+    scenes, cur = [], None
+    for s in pieces:
+        if cur is None:
+            cur = dict(s)
+        elif s["end"] - cur["start"] <= MAX_CLIP_SECONDS:
+            cur["text"] += " " + s["text"]
+            cur["end"] = s["end"]
+        else:
+            scenes.append(cur)
+            cur = dict(s)
+    if cur:
+        scenes.append(cur)
+
+    # Tile the timeline exactly: scene i runs until scene i+1 starts.
+    for i, sc in enumerate(scenes):
+        sc["end"] = scenes[i + 1]["start"] if i + 1 < len(scenes) else audio_len
+    scenes[0]["start"] = 0.0
+    out = []
+    for sc in scenes:
+        sc["start"], sc["end"] = round(sc["start"], 2), round(sc["end"], 2)
+        sc["duration"] = round(sc["end"] - sc["start"], 2)
+        if sc["duration"] > 0.2:
+            out.append(sc)
+    return out
 
 
 def audio_duration_seconds(path: str | Path) -> float:
@@ -710,30 +836,32 @@ def agent1_prompt(job: dict) -> str:
     """Agent 1 — break the script into N frame definitions + a style bible."""
     nar = job["narration"]
     n, durs = nar["n_clips"], nar["clip_durations"]
-    windows, t = [], 0.0
-    for i, d in enumerate(durs):
-        windows.append(f"frame {i + 1}: {t:.0f}s → {min(t + d, nar['audio_duration']):.0f}s "
-                       f"(clip length {d}s)")
-        t += d
-    spiritual = ("\n\n" + SPIRITUAL_DIRECTIVE) if job.get("spiritual") else ""
-    windows_txt = "\n".join(windows)
+    scenes = nar.get("scenes") or []
+    if scenes and scenes[0].get("text"):
+        windows_txt = "\n".join(
+            f'frame {i + 1}: {sc["start"]:.2f}s → {sc["end"]:.2f}s '
+            f'({sc["duration"]:.2f}s) — narration: "{sc["text"]}"'
+            for i, sc in enumerate(scenes))
+        cut_note = ("The frames were PRE-CUT from the narration's real timestamps — each "
+                    "frame covers exactly the narration text shown for its window. Use that "
+                    "text VERBATIM as narration_text and design the visuals for that text.")
+    else:
+        windows, t = [], 0.0
+        for i, d in enumerate(durs):
+            windows.append(f"frame {i + 1}: {t:.0f}s → "
+                           f"{min(t + d, nar['audio_duration']):.0f}s (clip length {d}s)")
+            t += d
+        windows_txt = "\n".join(windows)
+        cut_note = ""
+    spiritual = ("\n\n" + get_prompt("spiritual_directive")) if job.get("spiritual") else ""
     return f"""You are AGENT 1 — the "AI Script Breaker" for short-form narrated videos.{spiritual}
 
 The narration audio is {nar['audio_duration']:.1f} seconds long, so the film is split into
-EXACTLY {n} frames (RoundUp(audio seconds / 10), maximum 10s per frame). Time windows:
+EXACTLY {n} frames. Time windows:
 {windows_txt}
+{cut_note}
 
-YOUR 2 CORE OBJECTIVES — every creative decision serves them:
-1. EXTREMELY HIGH HOOK RATE — frame 1 must stop the scroll within 1.5 seconds.
-2. EXTREMELY HIGH VIEW-THROUGH RATE — every frame must end on a pull that forces the
-   viewer into the next frame; the final frame delivers the emotional payoff.
-
-MANDATORY CONSISTENCY RULES (apply across ALL frames):
-1. Tone/theme must be IDENTICAL in every frame.
-2. Personas/characters: define every character ONCE in the style bible (age, face, hair,
-   clothing, build) and reuse those exact descriptions in every frame they appear in.
-3. Continuity: each frame must begin exactly where the previous frame ended — state it.
-4. Visual style, color grade and lighting language must be the same in every frame.
+{get_prompt("agent1_core")}
 
 Return STRICT JSON only — no markdown fences, no commentary:
 {{
@@ -801,12 +929,7 @@ lighting are identical across all {n} frames:
 FRAME DEFINITION to convert into the prompt:
 {fr['definition_md']}
 
-Rules for the prompt you write:
-- Re-state every visible character with their FULL locked description from the style bible.
-- Open mid-action (no fade-ins, no dead air) and escalate visual interest every 2-3 seconds.
-- End on a moment that flows seamlessly into the next frame.
-- Specify camera, lighting, color grade and mood explicitly, matching the style bible.
-- Do NOT mention audio, narration, subtitles or text overlays.
+{get_prompt("agent2_core")}
 
 Return ONLY the final video-generation prompt text — no headers, no commentary, no markdown.
 """
@@ -824,11 +947,14 @@ def get_ffmpeg_exe() -> str:
         return exe
 
 
-def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio: str):
+def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio: str,
+                 exact_durations: list | None = None):
     """Concat all clips (normalized to one resolution) + the narration audio.
 
-    -shortest trims the video tail to the exact audio length (clips are
-    rounded UP to whole seconds, so video ≥ audio).
+    When exact_durations (from the narration timestamps) are given, every clip
+    is trimmed — or freeze-frame-padded — to EXACTLY its scene's length, so
+    each scene stays in sync with the narration it belongs to. -shortest then
+    trims any sub-frame remainder.
     """
     import subprocess
     w, h = STITCH_RESOLUTIONS.get(aspect_ratio, (1080, 1920))
@@ -837,11 +963,17 @@ def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio
     for p in clip_paths:
         cmd += ["-i", str(p)]
     cmd += ["-i", str(audio_path)]
-    filters = [
-        f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v{i}]"
-        for i in range(n)
-    ]
+    filters = []
+    for i in range(n):
+        chain = (f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24")
+        d = (exact_durations or [None] * n)[i]
+        if d:
+            # pad with a freeze frame in case the clip is shorter, then cut
+            # to the scene's exact narration duration
+            chain += (f",tpad=stop_mode=clone:stop_duration={MAX_CLIP_SECONDS},"
+                      f"trim=duration={d:.3f},setpts=PTS-STARTPTS")
+        filters.append(chain + f"[v{i}]")
     filters.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
     cmd += ["-filter_complex", ";".join(filters), "-map", "[v]", "-map", f"{n}:a:0",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
@@ -865,18 +997,38 @@ def process_narration_job(store, job):
 
     # -- Step 1: Text-to-speech ------------------------------------------------
     if not nar.get("audio_path") or not Path(nar["audio_path"]).exists():
-        set_stage("🎙️ Step 1/5 — ElevenLabs text-to-speech")
+        set_stage("🎙️ Step 1/5 — text-to-speech + narration timestamps")
         api_key = elevenlabs_api_key()
         if not api_key:
             raise RuntimeError("No ElevenLabs API key — add it in the "
                                "'Video from Script Narration' tab.")
         audio = proj / "narration.mp3"
-        elevenlabs_tts(api_key, job["voice_id"], job["script"], audio)
+        alignment = elevenlabs_tts(api_key, job["voice_id"], job["script"], audio)
+        audio_len = round(audio_duration_seconds(audio), 2)
+        scenes = []
+        if alignment:
+            (proj / "alignment.json").write_text(json.dumps(alignment))
+            scenes = build_scenes(alignment, audio_len)
+        if scenes:
+            durs = [int(min(MAX_CLIP_SECONDS,
+                            max(MIN_CLIP_SECONDS, math.ceil(sc["duration"]))))
+                    for sc in scenes]
+        else:  # no timestamps available — fall back to fixed 10s windows
+            durs = clip_durations(audio_len)
+            t = 0.0
+            for d in durs:
+                scenes.append({"text": "", "start": round(t, 2),
+                               "end": round(min(t + d, audio_len), 2),
+                               "duration": round(min(t + d, audio_len) - t, 2)})
+                t += d
+        (proj / "scenes.json").write_text(
+            json.dumps(scenes, ensure_ascii=False, indent=1))
         with store["lock"]:
             nar["audio_path"] = str(audio)
-            nar["audio_duration"] = round(audio_duration_seconds(audio), 2)
-            nar["clip_durations"] = clip_durations(nar["audio_duration"])
-            nar["n_clips"] = len(nar["clip_durations"])
+            nar["audio_duration"] = audio_len
+            nar["scenes"] = scenes
+            nar["clip_durations"] = durs
+            nar["n_clips"] = len(scenes)
         save_jobs_db(store)
 
     n = nar["n_clips"]
@@ -902,7 +1054,10 @@ def process_narration_job(store, job):
         for i, fdef in enumerate(frames_raw):
             md = frame_definition_md(fdef, i + 1, n, nar["clip_durations"][i])
             (proj / f"frame_{i + 1:02d}_definition.md").write_text(md)
+            scene = (nar.get("scenes") or [{}] * n)[i]
             frames.append({"index": i + 1, "duration": nar["clip_durations"][i],
+                           "exact_duration": scene.get("duration"),
+                           "scene_text": scene.get("text"),
                            "definition": fdef, "definition_md": md,
                            "prompt": None, "result": None})
         with store["lock"]:
@@ -941,7 +1096,8 @@ def process_narration_job(store, job):
         set_stage("🧵 Step 5/5 — stitching clips + narration audio")
         final = proj / f"narrated_video_{job['id']}.mp4"
         stitch_clips([f["result"]["path"] for f in nar["frames"]],
-                     nar["audio_path"], final, job.get("aspect_ratio", "9:16"))
+                     nar["audio_path"], final, job.get("aspect_ratio", "9:16"),
+                     [f.get("exact_duration") for f in nar["frames"]])
         with store["lock"]:
             nar["final_path"] = str(final)
         save_jobs_db(store)
@@ -1371,10 +1527,55 @@ if drive_enabled and drive_folder_id and not st.session_state.get("history_synce
     except Exception as e:  # noqa: BLE001
         st.warning(f"Could not sync Drive history: {str(e)[:150]}")
 
-tab_single, tab_script = st.tabs([
+tab_single, tab_script, tab_prompts = st.tabs([
     "🎬 Single Video / Frame Generation",
     "🎙️ Video from Script Narration",
+    "🧠 System Prompts",
 ])
+
+with tab_prompts:
+    st.caption("Every system prompt the pipeline injects, editable. Dynamic values "
+               "(your script, time windows, style bible, aspect ratio, durations…) "
+               "are inserted around these automatically. Edits apply to NEW jobs; "
+               "saved in `pipeline_settings.json` on this machine.")
+    _prompt_overrides = load_settings().get("prompts") or {}
+    PROMPT_METAS = [
+        ("spiritual_directive", "🕉️ Spiritual context directive",
+         "Appended to every generation prompt when the Spiritual toggle is on "
+         "(single tab), and to Agent 1's briefing in the narration pipeline."),
+        ("hook_video", "🔥 Hook + view-through directive — video",
+         "Appended to single-tab video prompts when the High hook toggle is on."),
+        ("hook_image", "🔥 Hook directive — image",
+         "Appended to single-tab image prompts when the High hook toggle is on."),
+        ("agent1_core", "🧠 Agent 1 — script breaker core instructions",
+         "The objectives + consistency rules inside Agent 1's prompt (narration "
+         "tab). The time windows, scene narration text and JSON output format "
+         "are added around this automatically."),
+        ("agent2_core", "✍️ Agent 2 — prompt writer rules",
+         "The rules block inside Agent 2's prompt (narration tab). The style "
+         "bible, frame definition and continuity notes are added automatically."),
+    ]
+    for _pkey, _ptitle, _pdesc in PROMPT_METAS:
+        _edited = _pkey in _prompt_overrides
+        with st.expander(_ptitle + ("  ·  ✏️ edited" if _edited else ""),
+                         expanded=False):
+            st.caption(_pdesc)
+            _pval = st.text_area(
+                "Prompt text", value=_prompt_overrides.get(_pkey) or DEFAULT_PROMPTS[_pkey],
+                height=240, key=f"prompt_edit_{_pkey}", label_visibility="collapsed")
+            _c1, _c2 = st.columns(2)
+            if _c1.button("💾 Save", key=f"prompt_save_{_pkey}",
+                          disabled=_pval.strip() == (_prompt_overrides.get(_pkey)
+                                                     or DEFAULT_PROMPTS[_pkey]).strip()):
+                _s = load_settings()
+                _s.setdefault("prompts", {})[_pkey] = _pval.strip()
+                save_settings(_s)
+                st.rerun()
+            if _edited and _c2.button("↩️ Reset to default", key=f"prompt_reset_{_pkey}"):
+                _s = load_settings()
+                (_s.get("prompts") or {}).pop(_pkey, None)
+                save_settings(_s)
+                st.rerun()
 
 with store["lock"]:
     all_jobs = list(store["jobs"])
@@ -1537,14 +1738,41 @@ with tab_single:
 # Tab 2 — Video from Script Narration
 # ---------------------------------------------------------------------------
 
+def _scene_table_md(scenes: list) -> str:
+    rows = ["| # | start | end | length | narration |",
+            "|---|-------|-----|--------|-----------|"]
+    for i, sc in enumerate(scenes, 1):
+        text = (sc.get("text") or "—").replace("|", "\\|")
+        rows.append(f"| {i} | {sc['start']:.2f}s | {sc['end']:.2f}s "
+                    f"| {sc['duration']:.2f}s | {text} |")
+    return "\n".join(rows)
+
+
 def render_narration_job(job):
     icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}.get(
         job["status"], "❔")
     nar = job.get("narration") or {}
-    with st.expander(f"{icon} 🎙️ [{job['status']}] {job.get('script', '')[:80]}",
-                     expanded=job["status"] in ("running", "done")):
+    frames = nar.get("frames") or []
+    scenes = nar.get("scenes") or []
+    running_stage = job.get("stage", "")
+
+    def mark(done: bool, active_key: str) -> str:
+        if done:
+            return "✅"
+        return "⏳" if (job["status"] == "running" and active_key in running_stage) else "🕓"
+
+    with st.container(border=True):
+        head, rm = st.columns([6, 1])
+        head.markdown(f"**{icon} 🎙️ [{job['status']}] {job.get('script', '')[:80]}**")
+        if rm.button("Remove", key=f"nrm_{job['id']}",
+                     disabled=job["status"] == "running"):
+            with store["lock"]:
+                store["jobs"][:] = [j for j in store["jobs"] if j["id"] != job["id"]]
+            save_jobs_db(store)
+            st.rerun()
+
         if job["status"] == "running":
-            st.info(f"**{job.get('stage', 'working…')}**")
+            st.info(f"**{running_stage or 'working…'}**")
         elif job["status"] == "queued":
             st.caption("Waiting for the background worker…")
         if job["status"] == "failed":
@@ -1562,62 +1790,104 @@ def render_narration_job(job):
                 f"{job.get('aspect_ratio', '?')}")
         if nar.get("audio_duration"):
             info += (f" · audio {nar['audio_duration']:.1f}s → "
-                     f"**{nar.get('n_clips')} clips** (RoundUp(audio/10))")
+                     f"**{nar.get('n_clips')} scenes**")
         if job.get("drive_upload"):
             info += " · ☁️ Drive"
         st.caption(info)
 
-        audio_path = nar.get("audio_path")
-        if audio_path and Path(audio_path).exists():
-            st.audio(Path(audio_path).read_bytes(), format="audio/mp3")
+        # ---- Step 1: narration audio + timestamps -----------------------------
+        s1_done = bool(nar.get("audio_path"))
+        with st.expander(f"{mark(s1_done, 'Step 1')} Step 1 — Narration audio & "
+                         "scene timestamps", expanded=not s1_done):
+            audio_path = nar.get("audio_path")
+            if audio_path and Path(audio_path).exists():
+                st.audio(Path(audio_path).read_bytes(), format="audio/mp3")
+            if scenes:
+                if scenes[0].get("text"):
+                    st.caption(f"{len(scenes)} scenes cut at sentence boundaries "
+                               "from the real TTS timestamps:")
+                else:
+                    st.caption(f"{len(scenes)} scenes (fixed windows — timestamps "
+                               "were unavailable for this run):")
+                st.markdown(_scene_table_md(scenes))
+            elif not s1_done:
+                st.caption("pending…")
 
-        if nar.get("style_bible_md"):
-            with st.popover("🎭 Style bible (locked across all frames)"):
+        # ---- Step 2: Agent 1 — style bible + frame definitions ----------------
+        s2_done = bool(nar.get("style_bible_md"))
+        with st.expander(f"{mark(s2_done, 'Step 2')} Step 2 — Agent 1: style bible "
+                         "& frame definitions", expanded=False):
+            if nar.get("style_bible_md"):
                 st.markdown(nar["style_bible_md"])
-
-        frames = nar.get("frames") or []
-        if frames:
-            frame_tabs = st.tabs([f"Frame {f['index']}" for f in frames])
-            for fr, ftab in zip(frames, frame_tabs):
-                with ftab:
-                    def_col, out_col = st.columns(2)
-                    with def_col:
-                        st.markdown("###### 📋 Frame definition (Agent 1)")
+                st.divider()
+            if frames:
+                for ftab, fr in zip(st.tabs([f"Frame {f['index']}" for f in frames]),
+                                    frames):
+                    with ftab:
                         st.markdown(fr.get("definition_md") or "_pending…_")
-                    with out_col:
-                        st.markdown("###### ✍️ Video prompt (Agent 2)")
+            elif not s2_done:
+                st.caption("pending…")
+
+        # ---- Step 3: Agent 2 — video prompts ----------------------------------
+        s3_done = bool(frames) and all(f.get("prompt") for f in frames)
+        with st.expander(f"{mark(s3_done, 'Step 3')} Step 3 — Agent 2: video "
+                         "prompts (one per frame)", expanded=False):
+            if frames:
+                for ftab, fr in zip(st.tabs([f"Frame {f['index']}" for f in frames]),
+                                    frames):
+                    with ftab:
                         if fr.get("prompt"):
                             st.text(fr["prompt"])
                         else:
                             st.caption("pending…")
+            else:
+                st.caption("pending…")
+
+        # ---- Step 4: generated clips ------------------------------------------
+        s4_done = bool(frames) and all(
+            (f.get("result") or {}).get("ok") for f in frames)
+        with st.expander(f"{mark(s4_done, 'Step 4')} Step 4 — Generated clips",
+                         expanded=False):
+            if frames:
+                done_clips = sum(1 for f in frames if (f.get('result') or {}).get('ok'))
+                st.caption(f"{done_clips}/{len(frames)} clips generated · each clip is "
+                           "trimmed to its scene's exact narration window at stitch time")
+                for ftab, fr in zip(st.tabs([f"Clip {f['index']}" for f in frames]),
+                                    frames):
+                    with ftab:
+                        if fr.get("exact_duration"):
+                            st.caption(f"scene length {fr['exact_duration']:.2f}s "
+                                       f"(generated at {fr.get('duration')}s)")
                         r = fr.get("result")
                         if r and r.get("ok") and r.get("path") and Path(r["path"]).exists():
                             st.video(Path(r["path"]).read_bytes())
                         elif r and not r.get("ok"):
                             st.error(f"Clip failed: {r.get('error')}")
+                        else:
+                            st.caption("pending…")
+            else:
+                st.caption("pending…")
 
+        # ---- Step 5: final stitched video --------------------------------------
         final_path = nar.get("final_path")
-        if final_path and Path(final_path).exists():
-            st.markdown("#### 🎞️ Final stitched video (clips + narration audio)")
-            final_data = Path(final_path).read_bytes()
-            st.video(final_data)
-            dl_col, drive_col = st.columns(2)
-            with dl_col:
-                st.download_button("⬇️ Download final MP4", data=final_data,
-                                   file_name=Path(final_path).name, mime="video/mp4",
-                                   key=f"ndl_{job['id']}")
-            with drive_col:
-                if nar.get("final_drive_link"):
-                    st.link_button("☁️ View on Drive", nar["final_drive_link"])
-                elif nar.get("final_drive_error"):
-                    st.caption(f"Drive upload failed: {nar['final_drive_error']}")
-
-        if st.button("Remove", key=f"nrm_{job['id']}",
-                     disabled=job["status"] == "running"):
-            with store["lock"]:
-                store["jobs"][:] = [j for j in store["jobs"] if j["id"] != job["id"]]
-            save_jobs_db(store)
-            st.rerun()
+        s5_done = bool(final_path and Path(final_path).exists())
+        with st.expander(f"{mark(s5_done, 'Step 5')} Step 5 — Final stitched video "
+                         "(clips + narration audio)", expanded=s5_done):
+            if s5_done:
+                final_data = Path(final_path).read_bytes()
+                st.video(final_data)
+                dl_col, drive_col = st.columns(2)
+                with dl_col:
+                    st.download_button("⬇️ Download final MP4", data=final_data,
+                                       file_name=Path(final_path).name,
+                                       mime="video/mp4", key=f"ndl_{job['id']}")
+                with drive_col:
+                    if nar.get("final_drive_link"):
+                        st.link_button("☁️ View on Drive", nar["final_drive_link"])
+                    elif nar.get("final_drive_error"):
+                        st.caption(f"Drive upload failed: {nar['final_drive_error']}")
+            else:
+                st.caption("pending…")
 
 
 with tab_script:
