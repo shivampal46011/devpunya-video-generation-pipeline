@@ -1884,8 +1884,27 @@ def render_narration_job(job):
                 with drive_col:
                     if nar.get("final_drive_link"):
                         st.link_button("☁️ View on Drive", nar["final_drive_link"])
-                    elif nar.get("final_drive_error"):
-                        st.caption(f"Drive upload failed: {nar['final_drive_error']}")
+                    else:
+                        if nar.get("final_drive_error"):
+                            st.caption(f"Drive upload failed: "
+                                       f"{nar['final_drive_error']}")
+                        if st.button("☁️ Upload to Drive", key=f"nup_{job['id']}"):
+                            folder = load_settings().get("drive_folder_id")
+                            if not folder or not get_drive_creds():
+                                st.error("Drive is not linked or no folder is set "
+                                         "— check the sidebar.")
+                            else:
+                                try:
+                                    with st.spinner("Uploading final video…"):
+                                        up = upload_to_drive(final_path, folder)
+                                    with store["lock"]:
+                                        nar["final_drive_link"] = up["link"]
+                                        nar["final_drive_id"] = up["id"]
+                                        nar["final_drive_error"] = None
+                                    save_jobs_db(store)
+                                    st.rerun()
+                                except Exception as e:  # noqa: BLE001
+                                    st.error(f"Upload failed: {str(e)[:200]}")
             else:
                 st.caption("pending…")
 
