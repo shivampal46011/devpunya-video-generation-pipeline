@@ -286,8 +286,10 @@ def generate_video(auth: dict, model: str, prompt_text: str,
 
     # API requires an explicit task: text_to_video, image_to_video,
     # reference_to_video, edit, or extend.
-    if image_bytes and (image_mime or "").startswith("video"):
-        task = video_task or "reference_to_video"
+    if image_bytes and video_task:
+        task = video_task
+    elif image_bytes and (image_mime or "").startswith("video"):
+        task = "reference_to_video"
     elif image_bytes:
         task = "image_to_video"
     else:
@@ -1082,9 +1084,11 @@ def process_narration_job(store, job):
             continue
         set_stage(f"🎬 Step 4/5 — generating clip {i + 1}/{n}")
         result = generate_video(
-            job["auth"], job["model"], fr["prompt"], None, None,
+            job["auth"], job["model"], fr["prompt"],
+            _job_image(job), job.get("image_mime"),
             fr["duration"], job.get("thinking_level", "medium"),
-            job.get("aspect_ratio", "9:16"))
+            job.get("aspect_ratio", "9:16"),
+            video_task="reference_to_video" if job.get("image_b64") else None)
         with store["lock"]:
             fr["result"] = result
         save_jobs_db(store)
@@ -1262,13 +1266,18 @@ def add_job(prompt: str, image_file=None, video_task: str | None = None):
     save_jobs_db(store)
 
 
-def add_narration_job(script: str, voice_id: str, voice_name: str, gender: str):
+def add_narration_job(script: str, voice_id: str, voice_name: str, gender: str,
+                      ref_file=None):
     """Queue a full script→narration→frames→stitched-video pipeline job."""
     job_id = uuid.uuid4().hex[:8]
     job = {
         "id": job_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "mode": "narration",
+        "image_name": ref_file.name if ref_file else None,
+        "image_b64": base64.b64encode(ref_file.getvalue()).decode()
+                     if ref_file else None,
+        "image_mime": ref_file.type if ref_file else None,
         "script": script.strip(),
         "prompt": script.strip()[:120],  # for shared queue displays
         "voice_id": voice_id,
@@ -1793,6 +1802,8 @@ def render_narration_job(job):
                      f"**{nar.get('n_clips')} scenes**")
         if job.get("drive_upload"):
             info += " · ☁️ Drive"
+        if job.get("image_name"):
+            info += f" · 🎞️ ref: {job['image_name']}"
         st.caption(info)
 
         # ---- Step 1: narration audio + timestamps -----------------------------
@@ -1960,6 +1971,12 @@ with tab_script:
         "Script (Hindi narration)", height=200, key="narration_script",
         placeholder="अपनी कहानी यहाँ लिखें… (the full narration script — the voice-over "
                     "is generated from this text exactly)")
+    narration_ref = st.file_uploader(
+        "Reference image or video (optional — style/persona anchor for ALL clips)",
+        type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm"],
+        key="narration_ref",
+        help="Sent with every clip generation as a reference_to_video anchor so "
+             "characters, style and setting stay consistent across all scenes.")
     st.caption("Example: a 53s narration → RoundUp(53/10) = **6 clips** of ≤10s each, "
                "generated with a consistent style bible and stitched over the audio. "
                "Video model / aspect ratio / Drive upload come from the sidebar.")
@@ -1971,9 +1988,11 @@ with tab_script:
             st.warning("Add your ElevenLabs API key in the voice settings above.")
         elif not narration_voice_id:
             st.warning("Pick a voice (or paste a voice ID) in the voice settings above.")
+        elif narration_ref is not None and narration_ref.size > 25 * 1024 * 1024:
+            st.warning("Reference file is too large — keep it under 25 MB.")
         else:
             add_narration_job(script_text, narration_voice_id,
-                              narration_voice_name, voice_gender)
+                              narration_voice_name, voice_gender, narration_ref)
             st.success("Narration pipeline queued — it runs in the background.")
             st.rerun()
 
