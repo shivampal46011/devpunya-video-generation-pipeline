@@ -12,6 +12,7 @@ Run:
 
 import base64
 import json
+import math
 import threading
 import time
 import uuid
@@ -573,6 +574,398 @@ choose **External**, fill the required fields, and add your own email under **Te
 
 
 # ---------------------------------------------------------------------------
+# Script-narration pipeline (Tab 2)
+#
+# Script → ElevenLabs Hindi TTS → clips = RoundUp(audio/10) → Agent 1 breaks
+# the script into frame definitions (+ locked style bible) → Agent 2 writes a
+# detailed prompt per frame → one video job per frame → ffmpeg stitches the
+# clips and lays the SAME narration audio over the whole film.
+# ---------------------------------------------------------------------------
+
+ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"  # supports Hindi
+AGENT_TEXT_MODEL = "gemini-2.5-flash"
+MAX_CLIP_SECONDS = 10
+MIN_CLIP_SECONDS = 4
+STITCH_RESOLUTIONS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
+
+
+def elevenlabs_api_key() -> str | None:
+    """The key lives in local settings (never mirrored to Drive) or secrets."""
+    return load_settings().get("elevenlabs_api_key") or _secret("elevenlabs_api_key")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_elevenlabs_voices(api_key: str) -> list:
+    import requests
+    r = requests.get(ELEVENLABS_VOICES_URL, headers={"xi-api-key": api_key}, timeout=30)
+    r.raise_for_status()
+    return r.json().get("voices", [])
+
+
+def elevenlabs_tts(api_key: str, voice_id: str, text: str, out_path: Path):
+    """Generate the narration MP3 (Indian Hindi voice picked by the user)."""
+    import requests
+    r = requests.post(
+        ELEVENLABS_TTS_URL.format(voice_id=voice_id),
+        headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+        json={
+            "text": text,
+            "model_id": ELEVENLABS_TTS_MODEL,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        },
+        timeout=300,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"ElevenLabs TTS failed ({r.status_code}): {r.text[:300]}")
+    out_path.write_bytes(r.content)
+
+
+def audio_duration_seconds(path: str | Path) -> float:
+    from mutagen import File as MutagenFile
+    info = MutagenFile(str(path))
+    if not info or not getattr(info, "info", None):
+        raise RuntimeError("Could not read the narration audio duration")
+    return float(info.info.length)
+
+
+def clip_durations(audio_len: float) -> list[int]:
+    """Number of clips = RoundUp(audio/10); each clip ≤10s (e.g. 53s → 6)."""
+    n = max(1, math.ceil(audio_len / MAX_CLIP_SECONDS))
+    durs = [MAX_CLIP_SECONDS] * (n - 1)
+    last = math.ceil(audio_len - MAX_CLIP_SECONDS * (n - 1))
+    durs.append(min(MAX_CLIP_SECONDS, max(MIN_CLIP_SECONDS, last)))
+    return durs
+
+
+def run_text_agent(auth: dict, prompt: str, max_retries: int = 3) -> str:
+    """One call to the text model (used by Agent 1 and Agent 2)."""
+    client = make_client(auth)
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.models.generate_content(model=AGENT_TEXT_MODEL, contents=prompt)
+            if not resp.text:
+                raise RuntimeError("Agent returned an empty response")
+            return resp.text
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt < max_retries:
+                msg = str(e).lower()
+                time.sleep(65 if ("429" in msg or "quota" in msg) else 2 * attempt)
+    raise RuntimeError(f"Text agent failed: {last_err}")
+
+
+def parse_agent_json(text: str) -> dict:
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise RuntimeError("Agent did not return JSON: " + text[:200])
+    return json.loads(text[start:end + 1])
+
+
+def strip_md_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
+
+
+def style_bible_md(sb: dict) -> str:
+    lines = ["# Style Bible (locked across ALL frames)", ""]
+    for key, label in [("tone_theme", "Tone / theme"), ("visual_style", "Visual style"),
+                       ("color_grade_lighting", "Color grade & lighting"),
+                       ("setting", "Setting")]:
+        if sb.get(key):
+            lines += [f"**{label}:** {sb[key]}", ""]
+    chars = sb.get("characters") or []
+    if chars:
+        lines.append("**Characters / personas (reuse these descriptions verbatim):**")
+        for c in chars:
+            lines.append(f"- **{c.get('name', '?')}** — {c.get('description', '')}")
+    return "\n".join(lines)
+
+
+def frame_definition_md(fdef: dict, index: int, n: int, duration: int) -> str:
+    lines = [f"# Frame {index} of {n} — {duration}s clip", ""]
+    for key, label in [("narration_text", "Narration covered"), ("scene", "Scene"),
+                       ("camera", "Camera"), ("emotion", "Emotion"),
+                       ("continuity_from_previous", "Continuity from previous frame"),
+                       ("hook_or_retention_device", "Hook / retention device")]:
+        if fdef.get(key):
+            lines += [f"**{label}:** {fdef[key]}", ""]
+    return "\n".join(lines)
+
+
+def agent1_prompt(job: dict) -> str:
+    """Agent 1 — break the script into N frame definitions + a style bible."""
+    nar = job["narration"]
+    n, durs = nar["n_clips"], nar["clip_durations"]
+    windows, t = [], 0.0
+    for i, d in enumerate(durs):
+        windows.append(f"frame {i + 1}: {t:.0f}s → {min(t + d, nar['audio_duration']):.0f}s "
+                       f"(clip length {d}s)")
+        t += d
+    spiritual = ("\n\n" + SPIRITUAL_DIRECTIVE) if job.get("spiritual") else ""
+    windows_txt = "\n".join(windows)
+    return f"""You are AGENT 1 — the "AI Script Breaker" for short-form narrated videos.{spiritual}
+
+The narration audio is {nar['audio_duration']:.1f} seconds long, so the film is split into
+EXACTLY {n} frames (RoundUp(audio seconds / 10), maximum 10s per frame). Time windows:
+{windows_txt}
+
+YOUR 2 CORE OBJECTIVES — every creative decision serves them:
+1. EXTREMELY HIGH HOOK RATE — frame 1 must stop the scroll within 1.5 seconds.
+2. EXTREMELY HIGH VIEW-THROUGH RATE — every frame must end on a pull that forces the
+   viewer into the next frame; the final frame delivers the emotional payoff.
+
+MANDATORY CONSISTENCY RULES (apply across ALL frames):
+1. Tone/theme must be IDENTICAL in every frame.
+2. Personas/characters: define every character ONCE in the style bible (age, face, hair,
+   clothing, build) and reuse those exact descriptions in every frame they appear in.
+3. Continuity: each frame must begin exactly where the previous frame ended — state it.
+4. Visual style, color grade and lighting language must be the same in every frame.
+
+Return STRICT JSON only — no markdown fences, no commentary:
+{{
+  "style_bible": {{
+    "tone_theme": "...",
+    "visual_style": "...",
+    "color_grade_lighting": "...",
+    "setting": "...",
+    "characters": [{{"name": "...", "description": "locked physical description reused verbatim"}}]
+  }},
+  "frames": [
+    {{
+      "index": 1,
+      "start_s": 0,
+      "end_s": 10,
+      "narration_text": "the exact part of the script this frame covers",
+      "scene": "what happens on screen, moment by moment",
+      "camera": "shot types and movement",
+      "emotion": "the emotional beat",
+      "continuity_from_previous": "how this frame picks up where the previous ended ('none' for frame 1)",
+      "hook_or_retention_device": "the specific device keeping the viewer watching"
+    }}
+  ]
+}}
+The "frames" array must contain EXACTLY {n} entries.
+
+SCRIPT (Hindi narration):
+\"\"\"{job['script']}\"\"\"
+"""
+
+
+def agent2_prompt(job: dict, i: int) -> str:
+    """Agent 2 — turn ONE frame definition into a detailed video prompt."""
+    nar = job["narration"]
+    fr = nar["frames"][i]
+    n = nar["n_clips"]
+    if i == 0:
+        prev_note = "This is the OPENING frame — it IS the hook."
+    else:
+        prev_note = ("PREVIOUS frame ended with: "
+                     + json.dumps(nar["frames"][i - 1].get("definition") or {},
+                                  ensure_ascii=False))
+    if i == n - 1:
+        next_note = ("This is the FINAL frame — land the emotional payoff and end on a "
+                     "composition that loops back to frame 1 to drive rewatches.")
+    else:
+        next_scene = (nar["frames"][i + 1].get("definition") or {}).get("scene") or ""
+        next_note = "NEXT frame will show: " + next_scene
+    return f"""You are AGENT 2 — an elite text-to-video prompt engineer.
+
+Write ONE detailed generation prompt for FRAME {i + 1} of {n} of a narrated short film.
+The clip is {fr['duration']} seconds, {job.get('aspect_ratio', '9:16')} aspect ratio, and SILENT
+(the same narration audio track is laid over all frames afterwards — never include
+speech, lip-sync, captions or on-screen text).
+
+2 CORE OBJECTIVES: extremely high hook rate and extremely high view-through rate.
+
+STYLE BIBLE — obey it EXACTLY so tone/theme, personas/characters, color grade and
+lighting are identical across all {n} frames:
+{nar['style_bible_md']}
+
+{prev_note}
+{next_note}
+
+FRAME DEFINITION to convert into the prompt:
+{fr['definition_md']}
+
+Rules for the prompt you write:
+- Re-state every visible character with their FULL locked description from the style bible.
+- Open mid-action (no fade-ins, no dead air) and escalate visual interest every 2-3 seconds.
+- End on a moment that flows seamlessly into the next frame.
+- Specify camera, lighting, color grade and mood explicitly, matching the style bible.
+- Do NOT mention audio, narration, subtitles or text overlays.
+
+Return ONLY the final video-generation prompt text — no headers, no commentary, no markdown.
+"""
+
+
+def get_ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        import shutil
+        exe = shutil.which("ffmpeg")
+        if not exe:
+            raise RuntimeError("ffmpeg not available — `pip install imageio-ffmpeg`")
+        return exe
+
+
+def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio: str):
+    """Concat all clips (normalized to one resolution) + the narration audio.
+
+    -shortest trims the video tail to the exact audio length (clips are
+    rounded UP to whole seconds, so video ≥ audio).
+    """
+    import subprocess
+    w, h = STITCH_RESOLUTIONS.get(aspect_ratio, (1080, 1920))
+    n = len(clip_paths)
+    cmd = [get_ffmpeg_exe(), "-y"]
+    for p in clip_paths:
+        cmd += ["-i", str(p)]
+    cmd += ["-i", str(audio_path)]
+    filters = [
+        f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v{i}]"
+        for i in range(n)
+    ]
+    filters.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
+    cmd += ["-filter_complex", ";".join(filters), "-map", "[v]", "-map", f"{n}:a:0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            str(out_path)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not Path(out_path).exists():
+        raise RuntimeError("ffmpeg stitch failed: " + (proc.stderr or "")[-400:])
+
+
+def process_narration_job(store, job):
+    """Full narration pipeline. Every stage is idempotent, so a failed job can
+    be re-queued and resumes exactly where it stopped."""
+    nar = job["narration"]
+    proj = Path(nar["dir"])
+    proj.mkdir(parents=True, exist_ok=True)
+
+    def set_stage(stage: str):
+        with store["lock"]:
+            job["stage"] = stage
+        save_jobs_db(store)
+
+    # -- Step 1: Text-to-speech ------------------------------------------------
+    if not nar.get("audio_path") or not Path(nar["audio_path"]).exists():
+        set_stage("🎙️ Step 1/5 — ElevenLabs text-to-speech")
+        api_key = elevenlabs_api_key()
+        if not api_key:
+            raise RuntimeError("No ElevenLabs API key — add it in the "
+                               "'Video from Script Narration' tab.")
+        audio = proj / "narration.mp3"
+        elevenlabs_tts(api_key, job["voice_id"], job["script"], audio)
+        with store["lock"]:
+            nar["audio_path"] = str(audio)
+            nar["audio_duration"] = round(audio_duration_seconds(audio), 2)
+            nar["clip_durations"] = clip_durations(nar["audio_duration"])
+            nar["n_clips"] = len(nar["clip_durations"])
+        save_jobs_db(store)
+
+    n = nar["n_clips"]
+
+    # -- Step 2: Agent 1 — script breaker → frame definitions -------------------
+    if not nar.get("frames"):
+        set_stage(f"🧠 Step 2/5 — Agent 1 breaking script into {n} frames")
+        base_prompt = agent1_prompt(job)
+        data = parse_agent_json(run_text_agent(job["auth"], base_prompt))
+        frames_raw = data.get("frames") or []
+        if len(frames_raw) != n:
+            data = parse_agent_json(run_text_agent(
+                job["auth"],
+                base_prompt + f"\n\nIMPORTANT: a previous answer had {len(frames_raw)} "
+                              f"frames — return EXACTLY {n} frames."))
+            frames_raw = data.get("frames") or []
+        if len(frames_raw) != n:
+            raise RuntimeError(f"Agent 1 returned {len(frames_raw)} frames instead of "
+                               f"{n} — hit Retry to run it again.")
+        sb_md = style_bible_md(data.get("style_bible") or {})
+        (proj / "style_bible.md").write_text(sb_md)
+        frames = []
+        for i, fdef in enumerate(frames_raw):
+            md = frame_definition_md(fdef, i + 1, n, nar["clip_durations"][i])
+            (proj / f"frame_{i + 1:02d}_definition.md").write_text(md)
+            frames.append({"index": i + 1, "duration": nar["clip_durations"][i],
+                           "definition": fdef, "definition_md": md,
+                           "prompt": None, "result": None})
+        with store["lock"]:
+            nar["style_bible_md"] = sb_md
+            nar["frames"] = frames
+        save_jobs_db(store)
+
+    # -- Step 3: Agent 2 — one detailed prompt per frame (run separately) -------
+    for i, fr in enumerate(nar["frames"]):
+        if fr.get("prompt"):
+            continue
+        set_stage(f"✍️ Step 3/5 — Agent 2 writing prompt for frame {i + 1}/{n}")
+        prompt = strip_md_fences(run_text_agent(job["auth"], agent2_prompt(job, i)))
+        (proj / f"frame_{i + 1:02d}_prompt.md").write_text(prompt)
+        with store["lock"]:
+            fr["prompt"] = prompt
+        save_jobs_db(store)
+
+    # -- Step 4: one video job per frame PROMPT file ----------------------------
+    for i, fr in enumerate(nar["frames"]):
+        if fr.get("result") and fr["result"].get("ok"):
+            continue
+        set_stage(f"🎬 Step 4/5 — generating clip {i + 1}/{n}")
+        result = generate_video(
+            job["auth"], job["model"], fr["prompt"], None, None,
+            fr["duration"], job.get("thinking_level", "medium"),
+            job.get("aspect_ratio", "9:16"))
+        with store["lock"]:
+            fr["result"] = result
+        save_jobs_db(store)
+        if not result["ok"]:
+            raise RuntimeError(f"Clip {i + 1}/{n} failed: {result['error']}")
+
+    # -- Step 5: stitch clips + the SAME narration audio ------------------------
+    if not nar.get("final_path") or not Path(nar["final_path"]).exists():
+        set_stage("🧵 Step 5/5 — stitching clips + narration audio")
+        final = proj / f"narrated_video_{job['id']}.mp4"
+        stitch_clips([f["result"]["path"] for f in nar["frames"]],
+                     nar["audio_path"], final, job.get("aspect_ratio", "9:16"))
+        with store["lock"]:
+            nar["final_path"] = str(final)
+        save_jobs_db(store)
+
+    # -- Save into Drive (local copy is kept for the download button) -----------
+    if job.get("drive_upload") and not nar.get("final_drive_link"):
+        set_stage("☁️ Uploading final video to Drive")
+        folder = load_settings().get("drive_folder_id")
+        if folder and get_drive_creds():
+            try:
+                up = upload_to_drive(nar["final_path"], folder)
+                with store["lock"]:
+                    nar["final_drive_link"] = up["link"]
+                    nar["final_drive_id"] = up["id"]
+            except Exception as e:  # noqa: BLE001
+                nar["final_drive_error"] = str(e)[:200]
+
+    with store["lock"]:
+        job["status"] = "done"
+        job["stage"] = "✅ Complete"
+    save_jobs_db(store)
+
+    folder = load_settings().get("drive_folder_id")
+    if job.get("drive_upload") and folder:
+        try:
+            drive_save_history(folder, store["jobs"])
+        except Exception:  # noqa: BLE001 — history mirror is best-effort
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Persistent job store + background worker
 #
 # Jobs live in a server-side store (survives page refreshes) backed by a
@@ -605,6 +998,9 @@ def _job_image(job):
 
 def process_job(store, job):
     """Full lifecycle for one job: generate all variations → upload → record."""
+    if job.get("mode") == "narration":
+        process_narration_job(store, job)
+        return
     while len(job["results"]) < job.get("variations", 1):
         if job["mode"] == "video":
             result = generate_video(
@@ -695,6 +1091,34 @@ def add_job(prompt: str, image_file=None):
         "image_mime": image_file.type if image_file else None,
         "status": "queued",
         "results": [],
+    }
+    with store["lock"]:
+        store["jobs"].append(job)
+    save_jobs_db(store)
+
+
+def add_narration_job(script: str, voice_id: str, voice_name: str, gender: str):
+    """Queue a full script→narration→frames→stitched-video pipeline job."""
+    job_id = uuid.uuid4().hex[:8]
+    job = {
+        "id": job_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "mode": "narration",
+        "script": script.strip(),
+        "prompt": script.strip()[:120],  # for shared queue displays
+        "voice_id": voice_id,
+        "voice_name": voice_name,
+        "voice_gender": gender,
+        "model": model if is_video else VIDEO_MODELS[0],
+        "aspect_ratio": aspect_ratio if is_video else "9:16",
+        "thinking_level": thinking_level,
+        "spiritual": bool(spiritual_mode),
+        "auth": dict(auth),
+        "drive_upload": bool(drive_enabled and drive_folder_id),
+        "status": "queued",
+        "stage": "🕓 queued",
+        "results": [],
+        "narration": {"dir": str(OUTPUT_DIR / f"narration_{job_id}"), "frames": []},
     }
     with store["lock"]:
         store["jobs"].append(job)
@@ -921,7 +1345,6 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 st.title("🎬 Automated Video Content Pipeline")
-st.caption("Queue text + image prompts, then batch-generate videos with Gemini.")
 
 # The Drive folder doubles as a persistent history DB: load it once per session.
 if drive_enabled and drive_folder_id and not st.session_state.get("history_synced"):
@@ -939,146 +1362,315 @@ if drive_enabled and drive_folder_id and not st.session_state.get("history_synce
     except Exception as e:  # noqa: BLE001
         st.warning(f"Could not sync Drive history: {str(e)[:150]}")
 
-with st.form("single_job", clear_on_submit=True):
-    prompt = st.text_area("Prompt", height=120,
-                          placeholder="Shiva meditating on Mount Kailash as dawn light "
-                                      "breaks through the clouds...")
-    image = st.file_uploader("Reference image (optional, video mode only)",
-                             type=["png", "jpg", "jpeg", "webp"])
-    if st.form_submit_button("Add to queue", type="primary"):
-        if prompt.strip():
-            add_job(prompt, image)
-            st.success("Job added.")
-        else:
-            st.warning("Prompt is empty.")
+tab_single, tab_script = st.tabs([
+    "🎬 Single Video / Frame Generation",
+    "🎙️ Video from Script Narration",
+])
 
-
-# ---------------------------------------------------------------------------
-# Queue view + run
-# ---------------------------------------------------------------------------
-
-st.divider()
 with store["lock"]:
-    jobs = list(store["jobs"])
-queued = [j for j in jobs if j["status"] == "queued"]
-running = [j for j in jobs if j["status"] == "running"]
-
-st.subheader(f"Queue — {len(jobs)} job(s) · {len(queued)} queued · "
-             f"{len(running)} running")
-st.caption("Jobs process automatically in the background — you can refresh or "
-           "close this page without losing progress. Results and Drive uploads "
-           "appear here as each variation finishes.")
+    all_jobs = list(store["jobs"])
+single_jobs = [j for j in all_jobs if j.get("mode") != "narration"]
+narration_jobs = [j for j in all_jobs if j.get("mode") == "narration"]
 
 
 # ---------------------------------------------------------------------------
-# Results
+# Tab 1 — Single Video / Frame Generation (job form + queue + results)
 # ---------------------------------------------------------------------------
 
-ok_results = [r for j in jobs for r in j.get("results") or [] if r["ok"]]
-if ok_results and st.toggle("Prepare ZIP of all files", value=False,
-                            help="Streams every file from Drive and bundles "
-                                 "them into one download."):
-    import io
-    import zipfile
-    buf = io.BytesIO()
-    added = 0
-    with zipfile.ZipFile(buf, "w") as zf:
-        for r in ok_results:
-            data = result_bytes(r)
-            if data:
-                zf.writestr(Path(r["path"]).name, data)
-                added += 1
-    st.download_button(
-        f"⬇️ Download all {added} file(s) as ZIP",
-        data=buf.getvalue(),
-        file_name=f"media_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
-        mime="application/zip",
-    )
-
-for job in jobs:
-    icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}[job["status"]]
-    kind_icon = "🎬" if job.get("mode", "video") == "video" else "🖼️"
-    with st.expander(f"{icon} {kind_icon} [{job['status']}] {job['prompt'][:90]}",
-                     expanded=job["status"] in ("done", "running")):
-        if job["status"] == "running":
-            done_n = len(job.get("results") or [])
-            total_n = max(job.get("variations", 1), 1)
-            st.progress(min(done_n / total_n, 0.95),
-                        text=f"Generating variation {min(done_n + 1, total_n)}/{total_n}…")
-        if job["status"] == "failed" and job.get("error"):
-            st.error(job["error"])
-        meta_col, media_col = st.columns([1, 2])
-        with meta_col:
-            st.write(f"**Job ID:** `{job['id']}`")
-            st.caption(f"{job.get('mode', 'video')} · {job.get('model', '?')} · "
-                       f"{job.get('aspect_ratio', '?')}"
-                       + (f" · {job.get('duration_s')}s" if job.get("mode") == "video" else "")
-                       + f" · {job.get('variations', 1)} variation(s)"
-                       + (" · ☁️ Drive" if job.get("drive_upload") else ""))
-            if job.get("image_b64"):
-                st.image(base64.b64decode(job["image_b64"]),
-                         caption=job.get("image_name"), width=220)
+with tab_single:
+    st.caption("Queue text + image prompts, then batch-generate videos with Gemini.")
+    with st.form("single_job", clear_on_submit=True):
+        prompt = st.text_area("Prompt", height=120,
+                              placeholder="Shiva meditating on Mount Kailash as dawn light "
+                                          "breaks through the clouds...")
+        image = st.file_uploader("Reference image (optional, video mode only)",
+                                 type=["png", "jpg", "jpeg", "webp"])
+        if st.form_submit_button("Add to queue", type="primary"):
+            if prompt.strip():
+                add_job(prompt, image)
+                st.success("Job added.")
             else:
-                st.caption("No reference image.")
-            if st.button("Remove", key=f"rm_{job['id']}",
-                         disabled=job["status"] == "running"):
+                st.warning("Prompt is empty.")
+
+    st.divider()
+    jobs = single_jobs
+    queued = [j for j in jobs if j["status"] == "queued"]
+    running = [j for j in jobs if j["status"] == "running"]
+
+    st.subheader(f"Queue — {len(jobs)} job(s) · {len(queued)} queued · "
+                 f"{len(running)} running")
+    st.caption("Jobs process automatically in the background — you can refresh or "
+               "close this page without losing progress. Results and Drive uploads "
+               "appear here as each variation finishes.")
+
+    ok_results = [r for j in jobs for r in j.get("results") or [] if r["ok"]]
+    if ok_results and st.toggle("Prepare ZIP of all files", value=False,
+                                help="Streams every file from Drive and bundles "
+                                     "them into one download."):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        added = 0
+        with zipfile.ZipFile(buf, "w") as zf:
+            for r in ok_results:
+                data = result_bytes(r)
+                if data:
+                    zf.writestr(Path(r["path"]).name, data)
+                    added += 1
+        st.download_button(
+            f"⬇️ Download all {added} file(s) as ZIP",
+            data=buf.getvalue(),
+            file_name=f"media_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+        )
+
+    for job in jobs:
+        icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}[job["status"]]
+        kind_icon = "🎬" if job.get("mode", "video") == "video" else "🖼️"
+        with st.expander(f"{icon} {kind_icon} [{job['status']}] {job['prompt'][:90]}",
+                         expanded=job["status"] in ("done", "running")):
+            if job["status"] == "running":
+                done_n = len(job.get("results") or [])
+                total_n = max(job.get("variations", 1), 1)
+                st.progress(min(done_n / total_n, 0.95),
+                            text=f"Generating variation {min(done_n + 1, total_n)}/{total_n}…")
+            if job["status"] == "failed" and job.get("error"):
+                st.error(job["error"])
+            meta_col, media_col = st.columns([1, 2])
+            with meta_col:
+                st.write(f"**Job ID:** `{job['id']}`")
+                st.caption(f"{job.get('mode', 'video')} · {job.get('model', '?')} · "
+                           f"{job.get('aspect_ratio', '?')}"
+                           + (f" · {job.get('duration_s')}s" if job.get("mode") == "video" else "")
+                           + f" · {job.get('variations', 1)} variation(s)"
+                           + (" · ☁️ Drive" if job.get("drive_upload") else ""))
+                if job.get("image_b64"):
+                    st.image(base64.b64decode(job["image_b64"]),
+                             caption=job.get("image_name"), width=220)
+                else:
+                    st.caption("No reference image.")
+                if st.button("Remove", key=f"rm_{job['id']}",
+                             disabled=job["status"] == "running"):
+                    with store["lock"]:
+                        store["jobs"][:] = [j for j in store["jobs"]
+                                            if j["id"] != job["id"]]
+                    save_jobs_db(store)
+                    st.rerun()
+
+            with media_col:
+                if job.get("final_prompt"):
+                    with st.popover("View full prompt sent to the model"):
+                        st.text(job["final_prompt"])
+                for i, result in enumerate(job.get("results") or []):
+                    if result["ok"]:
+                        is_mp4 = (result.get("path") or "").endswith(".mp4")
+                        data = result_bytes(result)
+                        if data:
+                            if is_mp4:
+                                st.video(data)
+                            else:
+                                st.image(data)
+                        else:
+                            st.caption("Media unavailable — not on Drive and no local copy.")
+                        src = "☁️ Drive" if result.get("drive_id") else "local"
+                        st.caption(f"Variation {i + 1} · {result.get('elapsed') or 0:.0f}s "
+                                   f"· {Path(result.get('path') or '?').name} · {src}")
+                        dl_col, drive_col = st.columns(2)
+                        with dl_col:
+                            if data:
+                                st.download_button(
+                                    "⬇️ Download " + ("MP4" if is_mp4 else "PNG"),
+                                    data=data,
+                                    file_name=Path(result["path"]).name,
+                                    mime="video/mp4" if is_mp4 else "image/png",
+                                    key=f"dl_{job['id']}_{i}",
+                                )
+                        with drive_col:
+                            if result.get("drive_link"):
+                                st.link_button("☁️ View on Drive", result["drive_link"])
+                            elif result.get("drive_error"):
+                                st.caption(f"Drive upload failed: {result['drive_error']}")
+                            elif drive_enabled and drive_folder_id:
+                                if st.button("☁️ Upload to Drive", key=f"up_{job['id']}_{i}"):
+                                    try:
+                                        upload_result_to_drive(result, drive_folder_id)
+                                        save_jobs_db(store)
+                                        drive_save_history(drive_folder_id, store["jobs"])
+                                    except Exception as e:  # noqa: BLE001
+                                        result["drive_error"] = str(e)[:200]
+                                    st.rerun()
+                        if result["text"]:
+                            st.caption(f"Model notes: {result['text'][:300]}")
+                    else:
+                        st.error(f"Variation {i + 1} failed: {result['error']}")
+
+
+# ---------------------------------------------------------------------------
+# Tab 2 — Video from Script Narration
+# ---------------------------------------------------------------------------
+
+def render_narration_job(job):
+    icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}.get(
+        job["status"], "❔")
+    nar = job.get("narration") or {}
+    with st.expander(f"{icon} 🎙️ [{job['status']}] {job.get('script', '')[:80]}",
+                     expanded=job["status"] in ("running", "done")):
+        if job["status"] == "running":
+            st.info(f"**{job.get('stage', 'working…')}**")
+        elif job["status"] == "queued":
+            st.caption("Waiting for the background worker…")
+        if job["status"] == "failed":
+            st.error(job.get("error") or "Failed")
+            if st.button("🔁 Retry (resumes where it stopped)",
+                         key=f"nretry_{job['id']}"):
                 with store["lock"]:
-                    store["jobs"][:] = [j for j in store["jobs"]
-                                        if j["id"] != job["id"]]
+                    job["status"] = "queued"
+                    job["error"] = None
                 save_jobs_db(store)
                 st.rerun()
 
-        with media_col:
-            if job.get("final_prompt"):
-                with st.popover("View full prompt sent to the model"):
-                    st.text(job["final_prompt"])
-            for i, result in enumerate(job.get("results") or []):
-                if result["ok"]:
-                    is_mp4 = (result.get("path") or "").endswith(".mp4")
-                    data = result_bytes(result)
-                    if data:
-                        if is_mp4:
-                            st.video(data)
+        info = (f"**Job ID:** `{job['id']}` · voice: {job.get('voice_name', '?')} "
+                f"({job.get('voice_gender', '?')}) · {job.get('model', '?')} · "
+                f"{job.get('aspect_ratio', '?')}")
+        if nar.get("audio_duration"):
+            info += (f" · audio {nar['audio_duration']:.1f}s → "
+                     f"**{nar.get('n_clips')} clips** (RoundUp(audio/10))")
+        if job.get("drive_upload"):
+            info += " · ☁️ Drive"
+        st.caption(info)
+
+        audio_path = nar.get("audio_path")
+        if audio_path and Path(audio_path).exists():
+            st.audio(Path(audio_path).read_bytes(), format="audio/mp3")
+
+        if nar.get("style_bible_md"):
+            with st.popover("🎭 Style bible (locked across all frames)"):
+                st.markdown(nar["style_bible_md"])
+
+        frames = nar.get("frames") or []
+        if frames:
+            frame_tabs = st.tabs([f"Frame {f['index']}" for f in frames])
+            for fr, ftab in zip(frames, frame_tabs):
+                with ftab:
+                    def_col, out_col = st.columns(2)
+                    with def_col:
+                        st.markdown("###### 📋 Frame definition (Agent 1)")
+                        st.markdown(fr.get("definition_md") or "_pending…_")
+                    with out_col:
+                        st.markdown("###### ✍️ Video prompt (Agent 2)")
+                        if fr.get("prompt"):
+                            st.text(fr["prompt"])
                         else:
-                            st.image(data)
-                    else:
-                        st.caption("Media unavailable — not on Drive and no local copy.")
-                    src = "☁️ Drive" if result.get("drive_id") else "local"
-                    st.caption(f"Variation {i + 1} · {result.get('elapsed') or 0:.0f}s "
-                               f"· {Path(result.get('path') or '?').name} · {src}")
-                    dl_col, drive_col = st.columns(2)
-                    with dl_col:
-                        if data:
-                            st.download_button(
-                                "⬇️ Download " + ("MP4" if is_mp4 else "PNG"),
-                                data=data,
-                                file_name=Path(result["path"]).name,
-                                mime="video/mp4" if is_mp4 else "image/png",
-                                key=f"dl_{job['id']}_{i}",
-                            )
-                    with drive_col:
-                        if result.get("drive_link"):
-                            st.link_button("☁️ View on Drive", result["drive_link"])
-                        elif result.get("drive_error"):
-                            st.caption(f"Drive upload failed: {result['drive_error']}")
-                        elif drive_enabled and drive_folder_id:
-                            if st.button("☁️ Upload to Drive", key=f"up_{job['id']}_{i}"):
-                                try:
-                                    upload_result_to_drive(result, drive_folder_id)
-                                    save_jobs_db(store)
-                                    drive_save_history(drive_folder_id, store["jobs"])
-                                except Exception as e:  # noqa: BLE001
-                                    result["drive_error"] = str(e)[:200]
-                                st.rerun()
-                    if result["text"]:
-                        st.caption(f"Model notes: {result['text'][:300]}")
-                else:
-                    st.error(f"Variation {i + 1} failed: {result['error']}")
+                            st.caption("pending…")
+                        r = fr.get("result")
+                        if r and r.get("ok") and r.get("path") and Path(r["path"]).exists():
+                            st.video(Path(r["path"]).read_bytes())
+                        elif r and not r.get("ok"):
+                            st.error(f"Clip failed: {r.get('error')}")
+
+        final_path = nar.get("final_path")
+        if final_path and Path(final_path).exists():
+            st.markdown("#### 🎞️ Final stitched video (clips + narration audio)")
+            final_data = Path(final_path).read_bytes()
+            st.video(final_data)
+            dl_col, drive_col = st.columns(2)
+            with dl_col:
+                st.download_button("⬇️ Download final MP4", data=final_data,
+                                   file_name=Path(final_path).name, mime="video/mp4",
+                                   key=f"ndl_{job['id']}")
+            with drive_col:
+                if nar.get("final_drive_link"):
+                    st.link_button("☁️ View on Drive", nar["final_drive_link"])
+                elif nar.get("final_drive_error"):
+                    st.caption(f"Drive upload failed: {nar['final_drive_error']}")
+
+        if st.button("Remove", key=f"nrm_{job['id']}",
+                     disabled=job["status"] == "running"):
+            with store["lock"]:
+                store["jobs"][:] = [j for j in store["jobs"] if j["id"] != job["id"]]
+            save_jobs_db(store)
+            st.rerun()
+
+
+with tab_script:
+    st.caption("Script → 🎙️ ElevenLabs Hindi narration → clips = RoundUp(audio/10) → "
+               "🧠 Agent 1 breaks the script into frame definitions → ✍️ Agent 2 writes "
+               "a detailed prompt per frame → 🎬 one video job per frame → 🧵 stitched "
+               "into one film over the same narration audio → ⬇️ download + ☁️ Drive.")
+
+    _nsettings = load_settings()
+    with st.expander("🎙️ ElevenLabs voice settings",
+                     expanded=not elevenlabs_api_key()):
+        key_in = st.text_input("ElevenLabs API key", type="password",
+                               value=_nsettings.get("elevenlabs_api_key", ""),
+                               help="Stored locally in pipeline_settings.json — "
+                                    "never mirrored to Drive.")
+        if key_in.strip() != _nsettings.get("elevenlabs_api_key", ""):
+            _nsettings["elevenlabs_api_key"] = key_in.strip()
+            save_settings(_nsettings)
+
+        voice_gender = st.radio("Narrator voice", ["Male", "Female"], horizontal=True)
+        st.caption("Target: **Indian, Hindi, 35–55 y/o**. Add such a voice to your "
+                   "ElevenLabs account from the Voice Library if none is listed — "
+                   "narration uses the multilingual model, which speaks Hindi.")
+
+        voices, voice_options = [], {}
+        api_key_now = elevenlabs_api_key()
+        if api_key_now:
+            try:
+                voices = fetch_elevenlabs_voices(api_key_now)
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"Could not fetch voices: {str(e)[:150]}")
+        matching = [v for v in voices
+                    if (v.get("labels") or {}).get("gender", "").lower()
+                    == voice_gender.lower()] or voices
+        for v in matching:
+            labels = ", ".join(str(x) for x in (v.get("labels") or {}).values() if x)
+            voice_options[f"{v['name']}" + (f" — {labels}" if labels else "")] = \
+                (v["voice_id"], v["name"])
+        chosen_voice = st.selectbox(
+            "Voice", list(voice_options) or ["— add an API key to list voices —"])
+        manual_voice = st.text_input("…or paste a voice ID (overrides the picker)",
+                                     placeholder="e.g. 21m00Tcm4TlvDq8ikWAM")
+        if manual_voice.strip():
+            narration_voice_id, narration_voice_name = manual_voice.strip(), "custom voice"
+        elif chosen_voice in voice_options:
+            narration_voice_id, narration_voice_name = voice_options[chosen_voice]
+        else:
+            narration_voice_id, narration_voice_name = None, None
+
+    script_text = st.text_area(
+        "Script (Hindi narration)", height=200, key="narration_script",
+        placeholder="अपनी कहानी यहाँ लिखें… (the full narration script — the voice-over "
+                    "is generated from this text exactly)")
+    st.caption("Example: a 53s narration → RoundUp(53/10) = **6 clips** of ≤10s each, "
+               "generated with a consistent style bible and stitched over the audio. "
+               "Video model / aspect ratio / Drive upload come from the sidebar.")
+
+    if st.button("🚀 Generate narrated video", type="primary"):
+        if not script_text.strip():
+            st.warning("Script is empty.")
+        elif not elevenlabs_api_key():
+            st.warning("Add your ElevenLabs API key in the voice settings above.")
+        elif not narration_voice_id:
+            st.warning("Pick a voice (or paste a voice ID) in the voice settings above.")
+        else:
+            add_narration_job(script_text, narration_voice_id,
+                              narration_voice_name, voice_gender)
+            st.success("Narration pipeline queued — it runs in the background.")
+            st.rerun()
+
+    st.divider()
+    st.subheader(f"Narration projects — {len(narration_jobs)}")
+    for _njob in reversed(narration_jobs):
+        render_narration_job(_njob)
 
 # ---------------------------------------------------------------------------
 # Live refresh while the background worker is busy
 # ---------------------------------------------------------------------------
 
-if any(j["status"] in ("queued", "running") for j in jobs):
+with store["lock"]:
+    _busy = any(j["status"] in ("queued", "running") for j in store["jobs"])
+if _busy:
     time.sleep(3)
     st.rerun()
