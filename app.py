@@ -604,22 +604,111 @@ def fetch_elevenlabs_voices(api_key: str) -> list:
     return r.json().get("voices", [])
 
 
-def elevenlabs_tts(api_key: str, voice_id: str, text: str, out_path: Path):
-    """Generate the narration MP3 (Indian Hindi voice picked by the user)."""
+ELEVENLABS_TTS_TS_URL = ("https://api.elevenlabs.io/v1/text-to-speech/"
+                         "{voice_id}/with-timestamps")
+
+
+def elevenlabs_tts(api_key: str, voice_id: str, text: str, out_path: Path) -> dict | None:
+    """Generate the narration MP3. Uses the with-timestamps endpoint so we get
+    character-level timing (returned as the alignment dict); falls back to the
+    plain endpoint (returns None) if timestamps are unavailable."""
     import requests
-    r = requests.post(
-        ELEVENLABS_TTS_URL.format(voice_id=voice_id),
-        headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-        json={
-            "text": text,
-            "model_id": ELEVENLABS_TTS_MODEL,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-        },
-        timeout=300,
-    )
+    payload = {
+        "text": text,
+        "model_id": ELEVENLABS_TTS_MODEL,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
+    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+    r = requests.post(ELEVENLABS_TTS_TS_URL.format(voice_id=voice_id),
+                      headers=headers, json=payload, timeout=300)
+    if r.status_code == 200:
+        data = r.json()
+        out_path.write_bytes(base64.b64decode(data["audio_base64"]))
+        return data.get("alignment") or data.get("normalized_alignment")
+    r = requests.post(ELEVENLABS_TTS_URL.format(voice_id=voice_id),
+                      headers=headers, json=payload, timeout=300)
     if r.status_code != 200:
         raise RuntimeError(f"ElevenLabs TTS failed ({r.status_code}): {r.text[:300]}")
     out_path.write_bytes(r.content)
+    return None
+
+
+SENTENCE_ENDERS = "।॥.!?\n"
+
+
+def build_scenes(alignment: dict, audio_len: float) -> list:
+    """Chunk the narration into scenes using the TTS character timestamps.
+
+    Sentences (split on Hindi/Latin sentence enders) are grouped into scenes of
+    at most MAX_CLIP_SECONDS; overlong sentences are split at word boundaries.
+    Scenes tile the audio exactly (pauses attach to the preceding scene), so
+    each scene knows the precise [start, end] of the narration it covers."""
+    chars = alignment.get("characters") or []
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    if not chars or len(chars) != len(starts) or len(chars) != len(ends):
+        return []
+
+    sentences, buf, t0 = [], [], None
+    for ch, s, e in zip(chars, starts, ends):
+        if t0 is None:
+            t0 = s
+        buf.append(ch)
+        if ch in SENTENCE_ENDERS:
+            text = "".join(buf).strip()
+            if text:
+                sentences.append({"text": text, "start": t0, "end": e})
+            buf, t0 = [], None
+    if buf:
+        text = "".join(buf).strip()
+        if text:
+            sentences.append({"text": text, "start": t0, "end": ends[-1]})
+    if not sentences:
+        return []
+
+    # Split any single sentence longer than one clip at word boundaries.
+    pieces = []
+    for s in sentences:
+        dur = s["end"] - s["start"]
+        if dur <= MAX_CLIP_SECONDS:
+            pieces.append(s)
+            continue
+        parts = max(2, math.ceil(dur / MAX_CLIP_SECONDS))
+        words = s["text"].split()
+        per = max(1, math.ceil(len(words) / parts))
+        seg = dur / parts
+        for k in range(parts):
+            wtext = " ".join(words[k * per:(k + 1) * per]).strip()
+            if wtext:
+                pieces.append({"text": wtext,
+                               "start": s["start"] + k * seg,
+                               "end": min(s["end"], s["start"] + (k + 1) * seg)})
+
+    # Group consecutive pieces into scenes of at most MAX_CLIP_SECONDS.
+    scenes, cur = [], None
+    for s in pieces:
+        if cur is None:
+            cur = dict(s)
+        elif s["end"] - cur["start"] <= MAX_CLIP_SECONDS:
+            cur["text"] += " " + s["text"]
+            cur["end"] = s["end"]
+        else:
+            scenes.append(cur)
+            cur = dict(s)
+    if cur:
+        scenes.append(cur)
+
+    # Tile the timeline exactly: scene i runs until scene i+1 starts.
+    for i, sc in enumerate(scenes):
+        sc["end"] = scenes[i + 1]["start"] if i + 1 < len(scenes) else audio_len
+    scenes[0]["start"] = 0.0
+    out = []
+    for sc in scenes:
+        sc["start"], sc["end"] = round(sc["start"], 2), round(sc["end"], 2)
+        sc["duration"] = round(sc["end"] - sc["start"], 2)
+        if sc["duration"] > 0.2:
+            out.append(sc)
+    return out
 
 
 def audio_duration_seconds(path: str | Path) -> float:
@@ -703,18 +792,30 @@ def agent1_prompt(job: dict) -> str:
     """Agent 1 — break the script into N frame definitions + a style bible."""
     nar = job["narration"]
     n, durs = nar["n_clips"], nar["clip_durations"]
-    windows, t = [], 0.0
-    for i, d in enumerate(durs):
-        windows.append(f"frame {i + 1}: {t:.0f}s → {min(t + d, nar['audio_duration']):.0f}s "
-                       f"(clip length {d}s)")
-        t += d
+    scenes = nar.get("scenes") or []
+    if scenes and scenes[0].get("text"):
+        windows_txt = "\n".join(
+            f'frame {i + 1}: {sc["start"]:.2f}s → {sc["end"]:.2f}s '
+            f'({sc["duration"]:.2f}s) — narration: "{sc["text"]}"'
+            for i, sc in enumerate(scenes))
+        cut_note = ("The frames were PRE-CUT from the narration's real timestamps — each "
+                    "frame covers exactly the narration text shown for its window. Use that "
+                    "text VERBATIM as narration_text and design the visuals for that text.")
+    else:
+        windows, t = [], 0.0
+        for i, d in enumerate(durs):
+            windows.append(f"frame {i + 1}: {t:.0f}s → "
+                           f"{min(t + d, nar['audio_duration']):.0f}s (clip length {d}s)")
+            t += d
+        windows_txt = "\n".join(windows)
+        cut_note = ""
     spiritual = ("\n\n" + SPIRITUAL_DIRECTIVE) if job.get("spiritual") else ""
-    windows_txt = "\n".join(windows)
     return f"""You are AGENT 1 — the "AI Script Breaker" for short-form narrated videos.{spiritual}
 
 The narration audio is {nar['audio_duration']:.1f} seconds long, so the film is split into
-EXACTLY {n} frames (RoundUp(audio seconds / 10), maximum 10s per frame). Time windows:
+EXACTLY {n} frames. Time windows:
 {windows_txt}
+{cut_note}
 
 YOUR 2 CORE OBJECTIVES — every creative decision serves them:
 1. EXTREMELY HIGH HOOK RATE — frame 1 must stop the scroll within 1.5 seconds.
@@ -817,11 +918,14 @@ def get_ffmpeg_exe() -> str:
         return exe
 
 
-def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio: str):
+def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio: str,
+                 exact_durations: list | None = None):
     """Concat all clips (normalized to one resolution) + the narration audio.
 
-    -shortest trims the video tail to the exact audio length (clips are
-    rounded UP to whole seconds, so video ≥ audio).
+    When exact_durations (from the narration timestamps) are given, every clip
+    is trimmed — or freeze-frame-padded — to EXACTLY its scene's length, so
+    each scene stays in sync with the narration it belongs to. -shortest then
+    trims any sub-frame remainder.
     """
     import subprocess
     w, h = STITCH_RESOLUTIONS.get(aspect_ratio, (1080, 1920))
@@ -830,11 +934,17 @@ def stitch_clips(clip_paths: list, audio_path: str, out_path: Path, aspect_ratio
     for p in clip_paths:
         cmd += ["-i", str(p)]
     cmd += ["-i", str(audio_path)]
-    filters = [
-        f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v{i}]"
-        for i in range(n)
-    ]
+    filters = []
+    for i in range(n):
+        chain = (f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24")
+        d = (exact_durations or [None] * n)[i]
+        if d:
+            # pad with a freeze frame in case the clip is shorter, then cut
+            # to the scene's exact narration duration
+            chain += (f",tpad=stop_mode=clone:stop_duration={MAX_CLIP_SECONDS},"
+                      f"trim=duration={d:.3f},setpts=PTS-STARTPTS")
+        filters.append(chain + f"[v{i}]")
     filters.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
     cmd += ["-filter_complex", ";".join(filters), "-map", "[v]", "-map", f"{n}:a:0",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
@@ -858,18 +968,38 @@ def process_narration_job(store, job):
 
     # -- Step 1: Text-to-speech ------------------------------------------------
     if not nar.get("audio_path") or not Path(nar["audio_path"]).exists():
-        set_stage("🎙️ Step 1/5 — ElevenLabs text-to-speech")
+        set_stage("🎙️ Step 1/5 — text-to-speech + narration timestamps")
         api_key = elevenlabs_api_key()
         if not api_key:
             raise RuntimeError("No ElevenLabs API key — add it in the "
                                "'Video from Script Narration' tab.")
         audio = proj / "narration.mp3"
-        elevenlabs_tts(api_key, job["voice_id"], job["script"], audio)
+        alignment = elevenlabs_tts(api_key, job["voice_id"], job["script"], audio)
+        audio_len = round(audio_duration_seconds(audio), 2)
+        scenes = []
+        if alignment:
+            (proj / "alignment.json").write_text(json.dumps(alignment))
+            scenes = build_scenes(alignment, audio_len)
+        if scenes:
+            durs = [int(min(MAX_CLIP_SECONDS,
+                            max(MIN_CLIP_SECONDS, math.ceil(sc["duration"]))))
+                    for sc in scenes]
+        else:  # no timestamps available — fall back to fixed 10s windows
+            durs = clip_durations(audio_len)
+            t = 0.0
+            for d in durs:
+                scenes.append({"text": "", "start": round(t, 2),
+                               "end": round(min(t + d, audio_len), 2),
+                               "duration": round(min(t + d, audio_len) - t, 2)})
+                t += d
+        (proj / "scenes.json").write_text(
+            json.dumps(scenes, ensure_ascii=False, indent=1))
         with store["lock"]:
             nar["audio_path"] = str(audio)
-            nar["audio_duration"] = round(audio_duration_seconds(audio), 2)
-            nar["clip_durations"] = clip_durations(nar["audio_duration"])
-            nar["n_clips"] = len(nar["clip_durations"])
+            nar["audio_duration"] = audio_len
+            nar["scenes"] = scenes
+            nar["clip_durations"] = durs
+            nar["n_clips"] = len(scenes)
         save_jobs_db(store)
 
     n = nar["n_clips"]
@@ -895,7 +1025,10 @@ def process_narration_job(store, job):
         for i, fdef in enumerate(frames_raw):
             md = frame_definition_md(fdef, i + 1, n, nar["clip_durations"][i])
             (proj / f"frame_{i + 1:02d}_definition.md").write_text(md)
+            scene = (nar.get("scenes") or [{}] * n)[i]
             frames.append({"index": i + 1, "duration": nar["clip_durations"][i],
+                           "exact_duration": scene.get("duration"),
+                           "scene_text": scene.get("text"),
                            "definition": fdef, "definition_md": md,
                            "prompt": None, "result": None})
         with store["lock"]:
@@ -934,7 +1067,8 @@ def process_narration_job(store, job):
         set_stage("🧵 Step 5/5 — stitching clips + narration audio")
         final = proj / f"narrated_video_{job['id']}.mp4"
         stitch_clips([f["result"]["path"] for f in nar["frames"]],
-                     nar["audio_path"], final, job.get("aspect_ratio", "9:16"))
+                     nar["audio_path"], final, job.get("aspect_ratio", "9:16"),
+                     [f.get("exact_duration") for f in nar["frames"]])
         with store["lock"]:
             nar["final_path"] = str(final)
         save_jobs_db(store)
