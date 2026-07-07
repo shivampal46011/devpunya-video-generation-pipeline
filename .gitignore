@@ -7,3 +7,4 @@ client_secret.json
 drive_token.json
 service_account.json
 pipeline_settings.json
+restart.log
