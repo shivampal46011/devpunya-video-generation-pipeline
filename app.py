@@ -97,9 +97,9 @@ def build_final_prompt(user_prompt: str, is_video: bool, aspect_ratio: str,
     """Layer the style directives onto the user's prompt."""
     parts = [user_prompt.strip()]
     if spiritual:
-        parts.append(SPIRITUAL_DIRECTIVE)
+        parts.append(get_prompt("spiritual_directive"))
     if high_retention:
-        parts.append(HOOK_DIRECTIVE_VIDEO if is_video else HOOK_DIRECTIVE_IMAGE)
+        parts.append(get_prompt("hook_video" if is_video else "hook_image"))
     if platform in PLATFORM_GUIDELINES:
         parts.append(PLATFORM_GUIDELINES[platform])
     if purpose in PURPOSE_GUIDELINES:
@@ -142,6 +142,43 @@ def cred_age_ok(path: Path) -> bool:
 
 def cred_days_left(path: Path) -> int:
     return max(0, int(CRED_MAX_AGE_DAYS - (time.time() - path.stat().st_mtime) / 86400))
+
+
+# ---------------------------------------------------------------------------
+# Editable system prompts — defaults live here; overrides in settings
+# ---------------------------------------------------------------------------
+
+AGENT1_CORE_DEFAULT = """YOUR 2 CORE OBJECTIVES — every creative decision serves them:
+1. EXTREMELY HIGH HOOK RATE — frame 1 must stop the scroll within 1.5 seconds.
+2. EXTREMELY HIGH VIEW-THROUGH RATE — every frame must end on a pull that forces the
+   viewer into the next frame; the final frame delivers the emotional payoff.
+
+MANDATORY CONSISTENCY RULES (apply across ALL frames):
+1. Tone/theme must be IDENTICAL in every frame.
+2. Personas/characters: define every character ONCE in the style bible (age, face, hair,
+   clothing, build) and reuse those exact descriptions in every frame they appear in.
+3. Continuity: each frame must begin exactly where the previous frame ended — state it.
+4. Visual style, color grade and lighting language must be the same in every frame."""
+
+AGENT2_CORE_DEFAULT = """Rules for the prompt you write:
+- Re-state every visible character with their FULL locked description from the style bible.
+- Open mid-action (no fade-ins, no dead air) and escalate visual interest every 2-3 seconds.
+- End on a moment that flows seamlessly into the next frame.
+- Specify camera, lighting, color grade and mood explicitly, matching the style bible.
+- Do NOT mention audio, narration, subtitles or text overlays."""
+
+DEFAULT_PROMPTS = {
+    "spiritual_directive": SPIRITUAL_DIRECTIVE,
+    "hook_video": HOOK_DIRECTIVE_VIDEO,
+    "hook_image": HOOK_DIRECTIVE_IMAGE,
+    "agent1_core": AGENT1_CORE_DEFAULT,
+    "agent2_core": AGENT2_CORE_DEFAULT,
+}
+
+
+def get_prompt(key: str) -> str:
+    """Effective prompt text: user override from settings, else the default."""
+    return (load_settings().get("prompts") or {}).get(key) or DEFAULT_PROMPTS[key]
 
 st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout="wide")
 
@@ -809,7 +846,7 @@ def agent1_prompt(job: dict) -> str:
             t += d
         windows_txt = "\n".join(windows)
         cut_note = ""
-    spiritual = ("\n\n" + SPIRITUAL_DIRECTIVE) if job.get("spiritual") else ""
+    spiritual = ("\n\n" + get_prompt("spiritual_directive")) if job.get("spiritual") else ""
     return f"""You are AGENT 1 — the "AI Script Breaker" for short-form narrated videos.{spiritual}
 
 The narration audio is {nar['audio_duration']:.1f} seconds long, so the film is split into
@@ -817,17 +854,7 @@ EXACTLY {n} frames. Time windows:
 {windows_txt}
 {cut_note}
 
-YOUR 2 CORE OBJECTIVES — every creative decision serves them:
-1. EXTREMELY HIGH HOOK RATE — frame 1 must stop the scroll within 1.5 seconds.
-2. EXTREMELY HIGH VIEW-THROUGH RATE — every frame must end on a pull that forces the
-   viewer into the next frame; the final frame delivers the emotional payoff.
-
-MANDATORY CONSISTENCY RULES (apply across ALL frames):
-1. Tone/theme must be IDENTICAL in every frame.
-2. Personas/characters: define every character ONCE in the style bible (age, face, hair,
-   clothing, build) and reuse those exact descriptions in every frame they appear in.
-3. Continuity: each frame must begin exactly where the previous frame ended — state it.
-4. Visual style, color grade and lighting language must be the same in every frame.
+{get_prompt("agent1_core")}
 
 Return STRICT JSON only — no markdown fences, no commentary:
 {{
@@ -895,12 +922,7 @@ lighting are identical across all {n} frames:
 FRAME DEFINITION to convert into the prompt:
 {fr['definition_md']}
 
-Rules for the prompt you write:
-- Re-state every visible character with their FULL locked description from the style bible.
-- Open mid-action (no fade-ins, no dead air) and escalate visual interest every 2-3 seconds.
-- End on a moment that flows seamlessly into the next frame.
-- Specify camera, lighting, color grade and mood explicitly, matching the style bible.
-- Do NOT mention audio, narration, subtitles or text overlays.
+{get_prompt("agent2_core")}
 
 Return ONLY the final video-generation prompt text — no headers, no commentary, no markdown.
 """
@@ -1496,10 +1518,55 @@ if drive_enabled and drive_folder_id and not st.session_state.get("history_synce
     except Exception as e:  # noqa: BLE001
         st.warning(f"Could not sync Drive history: {str(e)[:150]}")
 
-tab_single, tab_script = st.tabs([
+tab_single, tab_script, tab_prompts = st.tabs([
     "🎬 Single Video / Frame Generation",
     "🎙️ Video from Script Narration",
+    "🧠 System Prompts",
 ])
+
+with tab_prompts:
+    st.caption("Every system prompt the pipeline injects, editable. Dynamic values "
+               "(your script, time windows, style bible, aspect ratio, durations…) "
+               "are inserted around these automatically. Edits apply to NEW jobs; "
+               "saved in `pipeline_settings.json` on this machine.")
+    _prompt_overrides = load_settings().get("prompts") or {}
+    PROMPT_METAS = [
+        ("spiritual_directive", "🕉️ Spiritual context directive",
+         "Appended to every generation prompt when the Spiritual toggle is on "
+         "(single tab), and to Agent 1's briefing in the narration pipeline."),
+        ("hook_video", "🔥 Hook + view-through directive — video",
+         "Appended to single-tab video prompts when the High hook toggle is on."),
+        ("hook_image", "🔥 Hook directive — image",
+         "Appended to single-tab image prompts when the High hook toggle is on."),
+        ("agent1_core", "🧠 Agent 1 — script breaker core instructions",
+         "The objectives + consistency rules inside Agent 1's prompt (narration "
+         "tab). The time windows, scene narration text and JSON output format "
+         "are added around this automatically."),
+        ("agent2_core", "✍️ Agent 2 — prompt writer rules",
+         "The rules block inside Agent 2's prompt (narration tab). The style "
+         "bible, frame definition and continuity notes are added automatically."),
+    ]
+    for _pkey, _ptitle, _pdesc in PROMPT_METAS:
+        _edited = _pkey in _prompt_overrides
+        with st.expander(_ptitle + ("  ·  ✏️ edited" if _edited else ""),
+                         expanded=False):
+            st.caption(_pdesc)
+            _pval = st.text_area(
+                "Prompt text", value=_prompt_overrides.get(_pkey) or DEFAULT_PROMPTS[_pkey],
+                height=240, key=f"prompt_edit_{_pkey}", label_visibility="collapsed")
+            _c1, _c2 = st.columns(2)
+            if _c1.button("💾 Save", key=f"prompt_save_{_pkey}",
+                          disabled=_pval.strip() == (_prompt_overrides.get(_pkey)
+                                                     or DEFAULT_PROMPTS[_pkey]).strip()):
+                _s = load_settings()
+                _s.setdefault("prompts", {})[_pkey] = _pval.strip()
+                save_settings(_s)
+                st.rerun()
+            if _edited and _c2.button("↩️ Reset to default", key=f"prompt_reset_{_pkey}"):
+                _s = load_settings()
+                (_s.get("prompts") or {}).pop(_pkey, None)
+                save_settings(_s)
+                st.rerun()
 
 with store["lock"]:
     all_jobs = list(store["jobs"])
