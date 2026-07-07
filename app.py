@@ -1643,14 +1643,41 @@ with tab_single:
 # Tab 2 — Video from Script Narration
 # ---------------------------------------------------------------------------
 
+def _scene_table_md(scenes: list) -> str:
+    rows = ["| # | start | end | length | narration |",
+            "|---|-------|-----|--------|-----------|"]
+    for i, sc in enumerate(scenes, 1):
+        text = (sc.get("text") or "—").replace("|", "\\|")
+        rows.append(f"| {i} | {sc['start']:.2f}s | {sc['end']:.2f}s "
+                    f"| {sc['duration']:.2f}s | {text} |")
+    return "\n".join(rows)
+
+
 def render_narration_job(job):
     icon = {"queued": "🕓", "running": "⏳", "done": "✅", "failed": "❌"}.get(
         job["status"], "❔")
     nar = job.get("narration") or {}
-    with st.expander(f"{icon} 🎙️ [{job['status']}] {job.get('script', '')[:80]}",
-                     expanded=job["status"] in ("running", "done")):
+    frames = nar.get("frames") or []
+    scenes = nar.get("scenes") or []
+    running_stage = job.get("stage", "")
+
+    def mark(done: bool, active_key: str) -> str:
+        if done:
+            return "✅"
+        return "⏳" if (job["status"] == "running" and active_key in running_stage) else "🕓"
+
+    with st.container(border=True):
+        head, rm = st.columns([6, 1])
+        head.markdown(f"**{icon} 🎙️ [{job['status']}] {job.get('script', '')[:80]}**")
+        if rm.button("Remove", key=f"nrm_{job['id']}",
+                     disabled=job["status"] == "running"):
+            with store["lock"]:
+                store["jobs"][:] = [j for j in store["jobs"] if j["id"] != job["id"]]
+            save_jobs_db(store)
+            st.rerun()
+
         if job["status"] == "running":
-            st.info(f"**{job.get('stage', 'working…')}**")
+            st.info(f"**{running_stage or 'working…'}**")
         elif job["status"] == "queued":
             st.caption("Waiting for the background worker…")
         if job["status"] == "failed":
@@ -1668,62 +1695,104 @@ def render_narration_job(job):
                 f"{job.get('aspect_ratio', '?')}")
         if nar.get("audio_duration"):
             info += (f" · audio {nar['audio_duration']:.1f}s → "
-                     f"**{nar.get('n_clips')} clips** (RoundUp(audio/10))")
+                     f"**{nar.get('n_clips')} scenes**")
         if job.get("drive_upload"):
             info += " · ☁️ Drive"
         st.caption(info)
 
-        audio_path = nar.get("audio_path")
-        if audio_path and Path(audio_path).exists():
-            st.audio(Path(audio_path).read_bytes(), format="audio/mp3")
+        # ---- Step 1: narration audio + timestamps -----------------------------
+        s1_done = bool(nar.get("audio_path"))
+        with st.expander(f"{mark(s1_done, 'Step 1')} Step 1 — Narration audio & "
+                         "scene timestamps", expanded=not s1_done):
+            audio_path = nar.get("audio_path")
+            if audio_path and Path(audio_path).exists():
+                st.audio(Path(audio_path).read_bytes(), format="audio/mp3")
+            if scenes:
+                if scenes[0].get("text"):
+                    st.caption(f"{len(scenes)} scenes cut at sentence boundaries "
+                               "from the real TTS timestamps:")
+                else:
+                    st.caption(f"{len(scenes)} scenes (fixed windows — timestamps "
+                               "were unavailable for this run):")
+                st.markdown(_scene_table_md(scenes))
+            elif not s1_done:
+                st.caption("pending…")
 
-        if nar.get("style_bible_md"):
-            with st.popover("🎭 Style bible (locked across all frames)"):
+        # ---- Step 2: Agent 1 — style bible + frame definitions ----------------
+        s2_done = bool(nar.get("style_bible_md"))
+        with st.expander(f"{mark(s2_done, 'Step 2')} Step 2 — Agent 1: style bible "
+                         "& frame definitions", expanded=False):
+            if nar.get("style_bible_md"):
                 st.markdown(nar["style_bible_md"])
-
-        frames = nar.get("frames") or []
-        if frames:
-            frame_tabs = st.tabs([f"Frame {f['index']}" for f in frames])
-            for fr, ftab in zip(frames, frame_tabs):
-                with ftab:
-                    def_col, out_col = st.columns(2)
-                    with def_col:
-                        st.markdown("###### 📋 Frame definition (Agent 1)")
+                st.divider()
+            if frames:
+                for ftab, fr in zip(st.tabs([f"Frame {f['index']}" for f in frames]),
+                                    frames):
+                    with ftab:
                         st.markdown(fr.get("definition_md") or "_pending…_")
-                    with out_col:
-                        st.markdown("###### ✍️ Video prompt (Agent 2)")
+            elif not s2_done:
+                st.caption("pending…")
+
+        # ---- Step 3: Agent 2 — video prompts ----------------------------------
+        s3_done = bool(frames) and all(f.get("prompt") for f in frames)
+        with st.expander(f"{mark(s3_done, 'Step 3')} Step 3 — Agent 2: video "
+                         "prompts (one per frame)", expanded=False):
+            if frames:
+                for ftab, fr in zip(st.tabs([f"Frame {f['index']}" for f in frames]),
+                                    frames):
+                    with ftab:
                         if fr.get("prompt"):
                             st.text(fr["prompt"])
                         else:
                             st.caption("pending…")
+            else:
+                st.caption("pending…")
+
+        # ---- Step 4: generated clips ------------------------------------------
+        s4_done = bool(frames) and all(
+            (f.get("result") or {}).get("ok") for f in frames)
+        with st.expander(f"{mark(s4_done, 'Step 4')} Step 4 — Generated clips",
+                         expanded=False):
+            if frames:
+                done_clips = sum(1 for f in frames if (f.get('result') or {}).get('ok'))
+                st.caption(f"{done_clips}/{len(frames)} clips generated · each clip is "
+                           "trimmed to its scene's exact narration window at stitch time")
+                for ftab, fr in zip(st.tabs([f"Clip {f['index']}" for f in frames]),
+                                    frames):
+                    with ftab:
+                        if fr.get("exact_duration"):
+                            st.caption(f"scene length {fr['exact_duration']:.2f}s "
+                                       f"(generated at {fr.get('duration')}s)")
                         r = fr.get("result")
                         if r and r.get("ok") and r.get("path") and Path(r["path"]).exists():
                             st.video(Path(r["path"]).read_bytes())
                         elif r and not r.get("ok"):
                             st.error(f"Clip failed: {r.get('error')}")
+                        else:
+                            st.caption("pending…")
+            else:
+                st.caption("pending…")
 
+        # ---- Step 5: final stitched video --------------------------------------
         final_path = nar.get("final_path")
-        if final_path and Path(final_path).exists():
-            st.markdown("#### 🎞️ Final stitched video (clips + narration audio)")
-            final_data = Path(final_path).read_bytes()
-            st.video(final_data)
-            dl_col, drive_col = st.columns(2)
-            with dl_col:
-                st.download_button("⬇️ Download final MP4", data=final_data,
-                                   file_name=Path(final_path).name, mime="video/mp4",
-                                   key=f"ndl_{job['id']}")
-            with drive_col:
-                if nar.get("final_drive_link"):
-                    st.link_button("☁️ View on Drive", nar["final_drive_link"])
-                elif nar.get("final_drive_error"):
-                    st.caption(f"Drive upload failed: {nar['final_drive_error']}")
-
-        if st.button("Remove", key=f"nrm_{job['id']}",
-                     disabled=job["status"] == "running"):
-            with store["lock"]:
-                store["jobs"][:] = [j for j in store["jobs"] if j["id"] != job["id"]]
-            save_jobs_db(store)
-            st.rerun()
+        s5_done = bool(final_path and Path(final_path).exists())
+        with st.expander(f"{mark(s5_done, 'Step 5')} Step 5 — Final stitched video "
+                         "(clips + narration audio)", expanded=s5_done):
+            if s5_done:
+                final_data = Path(final_path).read_bytes()
+                st.video(final_data)
+                dl_col, drive_col = st.columns(2)
+                with dl_col:
+                    st.download_button("⬇️ Download final MP4", data=final_data,
+                                       file_name=Path(final_path).name,
+                                       mime="video/mp4", key=f"ndl_{job['id']}")
+                with drive_col:
+                    if nar.get("final_drive_link"):
+                        st.link_button("☁️ View on Drive", nar["final_drive_link"])
+                    elif nar.get("final_drive_error"):
+                        st.caption(f"Drive upload failed: {nar['final_drive_error']}")
+            else:
+                st.caption("pending…")
 
 
 with tab_script:
