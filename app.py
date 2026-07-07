@@ -150,16 +150,17 @@ st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout
 # Generation core (adapted from your snippet)
 # ---------------------------------------------------------------------------
 
-def build_input(prompt_text: str, image_bytes: bytes | None, image_mime: str | None):
-    """Build the interaction input: plain text, or text + inline image parts."""
-    if not image_bytes:
+def build_input(prompt_text: str, media_bytes: bytes | None, media_mime: str | None):
+    """Build the interaction input: plain text, or text + inline image/video parts."""
+    if not media_bytes:
         return prompt_text
+    kind = "video" if (media_mime or "").startswith("video") else "image"
     return [
         {"type": "text", "text": prompt_text},
         {
-            "type": "image",
-            "data": base64.b64encode(image_bytes).decode("utf-8"),
-            "mime_type": image_mime or "image/png",
+            "type": kind,
+            "data": base64.b64encode(media_bytes).decode("utf-8"),
+            "mime_type": media_mime or "image/png",
         },
     ]
 
@@ -242,18 +243,24 @@ def make_client(auth: dict) -> genai.Client:
 def generate_video(auth: dict, model: str, prompt_text: str,
                    image_bytes: bytes | None, image_mime: str | None,
                    duration_s: int, thinking_level: str, aspect_ratio: str = "9:16",
-                   max_retries: int = 3) -> dict:
+                   max_retries: int = 3, video_task: str | None = None) -> dict:
     """Generate one video. Returns {ok, path, text, error, elapsed}."""
     client = make_client(auth)
 
     # API requires an explicit task: text_to_video, image_to_video,
     # reference_to_video, edit, or extend.
+    if image_bytes and (image_mime or "").startswith("video"):
+        task = video_task or "reference_to_video"
+    elif image_bytes:
+        task = "image_to_video"
+    else:
+        task = "text_to_video"
     rich_kwargs = {
         "generation_config": {
             "max_output_tokens": 65536,
             "thinking_level": thinking_level,
             "video_config": {
-                "task": "image_to_video" if image_bytes else "text_to_video",
+                "task": task,
             },
         },
         "response_modalities": ["video"],
@@ -1007,7 +1014,8 @@ def process_job(store, job):
                 job["auth"], job["model"], job["final_prompt"],
                 _job_image(job), job.get("image_mime"),
                 job.get("duration_s") or 12, job.get("thinking_level", "medium"),
-                job.get("aspect_ratio", "9:16"))
+                job.get("aspect_ratio", "9:16"),
+                video_task=job.get("video_task"))
         else:
             result = generate_image(
                 job["auth"], job["model"], job["final_prompt"],
@@ -1068,7 +1076,7 @@ def get_store():
 store = get_store()
 
 
-def add_job(prompt: str, image_file=None):
+def add_job(prompt: str, image_file=None, video_task: str | None = None):
     """Snapshot ALL current settings into the job — the full request body."""
     job = {
         "id": uuid.uuid4().hex[:8],
@@ -1089,6 +1097,7 @@ def add_job(prompt: str, image_file=None):
         "image_b64": base64.b64encode(image_file.getvalue()).decode()
                      if image_file else None,
         "image_mime": image_file.type if image_file else None,
+        "video_task": video_task,
         "status": "queued",
         "results": [],
     }
@@ -1383,14 +1392,28 @@ with tab_single:
         prompt = st.text_area("Prompt", height=120,
                               placeholder="Shiva meditating on Mount Kailash as dawn light "
                                           "breaks through the clouds...")
-        image = st.file_uploader("Reference image (optional, video mode only)",
-                                 type=["png", "jpg", "jpeg", "webp"])
+        image = st.file_uploader(
+            "Reference image or video (optional, video mode only)",
+            type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm"])
+        VIDEO_TASKS = {
+            "🎨 Style / content reference (reference_to_video)": "reference_to_video",
+            "➕ Continue it (extend)": "extend",
+            "✏️ Modify it per the prompt (edit)": "edit",
+        }
+        video_task_label = st.selectbox(
+            "If the reference is a VIDEO, use it to…", list(VIDEO_TASKS),
+            help="Only applies when the uploaded reference is a video. Images "
+                 "always use image_to_video.")
         if st.form_submit_button("Add to queue", type="primary"):
-            if prompt.strip():
-                add_job(prompt, image)
-                st.success("Job added.")
-            else:
+            if not prompt.strip():
                 st.warning("Prompt is empty.")
+            elif image is not None and (image.type or "").startswith("video") \
+                    and len(image.getvalue()) > 25 * 1024 * 1024:
+                st.warning("Reference video is too large — keep it under 25 MB "
+                           "(it is sent inline with the API request).")
+            else:
+                add_job(prompt, image, VIDEO_TASKS[video_task_label])
+                st.success("Job added.")
 
     st.divider()
     jobs = single_jobs
@@ -1445,10 +1468,15 @@ with tab_single:
                            + f" · {job.get('variations', 1)} variation(s)"
                            + (" · ☁️ Drive" if job.get("drive_upload") else ""))
                 if job.get("image_b64"):
-                    st.image(base64.b64decode(job["image_b64"]),
-                             caption=job.get("image_name"), width=220)
+                    ref_bytes = base64.b64decode(job["image_b64"])
+                    if (job.get("image_mime") or "").startswith("video"):
+                        st.video(ref_bytes)
+                        st.caption(f"Reference video: {job.get('image_name')} · "
+                                   f"task: {job.get('video_task') or 'reference_to_video'}")
+                    else:
+                        st.image(ref_bytes, caption=job.get("image_name"), width=220)
                 else:
-                    st.caption("No reference image.")
+                    st.caption("No reference media.")
                 if st.button("Remove", key=f"rm_{job['id']}",
                              disabled=job["status"] == "running"):
                     with store["lock"]:
