@@ -187,19 +187,21 @@ st.set_page_config(page_title="Video Content Pipeline", page_icon="🎬", layout
 # Generation core (adapted from your snippet)
 # ---------------------------------------------------------------------------
 
-def build_input(prompt_text: str, media_bytes: bytes | None, media_mime: str | None):
-    """Build the interaction input: plain text, or text + inline image/video parts."""
-    if not media_bytes:
+def build_input(prompt_text: str, media: list | None):
+    """Build the interaction input: plain text, or text + inline media parts.
+
+    media is a list of (bytes, mime) tuples — any mix of images and videos."""
+    if not media:
         return prompt_text
-    kind = "video" if (media_mime or "").startswith("video") else "image"
-    return [
-        {"type": "text", "text": prompt_text},
-        {
+    parts = [{"type": "text", "text": prompt_text}]
+    for data, mime in media:
+        kind = "video" if (mime or "").startswith("video") else "image"
+        parts.append({
             "type": kind,
-            "data": base64.b64encode(media_bytes).decode("utf-8"),
-            "mime_type": media_mime or "image/png",
-        },
-    ]
+            "data": base64.b64encode(data).decode("utf-8"),
+            "mime_type": mime or "image/png",
+        })
+    return parts
 
 
 def _pget(obj, key, default=None):
@@ -278,19 +280,21 @@ def make_client(auth: dict) -> genai.Client:
 
 
 def generate_video(auth: dict, model: str, prompt_text: str,
-                   image_bytes: bytes | None, image_mime: str | None,
+                   media: list | None,
                    duration_s: int, thinking_level: str, aspect_ratio: str = "9:16",
                    max_retries: int = 3, video_task: str | None = None) -> dict:
-    """Generate one video. Returns {ok, path, text, error, elapsed}."""
+    """Generate one video. media is a list of (bytes, mime) reference files.
+    Returns {ok, path, text, error, elapsed}."""
     client = make_client(auth)
 
     # API requires an explicit task: text_to_video, image_to_video,
     # reference_to_video, edit, or extend.
-    if image_bytes and video_task:
+    has_video_ref = any((m or "").startswith("video") for _, m in media or [])
+    if media and video_task:
         task = video_task
-    elif image_bytes and (image_mime or "").startswith("video"):
+    elif media and (has_video_ref or len(media) > 1):
         task = "reference_to_video"
-    elif image_bytes:
+    elif media:
         task = "image_to_video"
     else:
         task = "text_to_video"
@@ -319,7 +323,7 @@ def generate_video(auth: dict, model: str, prompt_text: str,
         try:
             interaction = client.interactions.create(
                 model=model,
-                input=build_input(prompt_text, image_bytes, image_mime),
+                input=build_input(prompt_text, media),
                 **(rich_kwargs if use_rich else {}),
             )
             video_bytes, text = extract_video_bytes(interaction)
@@ -1083,20 +1087,20 @@ def process_narration_job(store, job):
         if fr.get("result") and fr["result"].get("ok"):
             continue
         set_stage(f"🎬 Step 4/5 — generating clip {i + 1}/{n}")
+        job_media = _job_media(job)
         result = generate_video(
-            job["auth"], job["model"], fr["prompt"],
-            _job_image(job), job.get("image_mime"),
+            job["auth"], job["model"], fr["prompt"], job_media,
             fr["duration"], job.get("thinking_level", "medium"),
             job.get("aspect_ratio", "9:16"),
-            video_task="reference_to_video" if job.get("image_b64") else None)
-        if (not result["ok"] and job.get("image_b64")
+            video_task="reference_to_video" if job_media else None)
+        if (not result["ok"] and job_media
                 and ("invalid" in str(result.get("error", "")).lower()
                      or "400" in str(result.get("error", "")))):
-            # The API sometimes rejects the reference for a specific clip —
-            # regenerate this clip without it rather than failing the project.
+            # The API sometimes rejects the references for a specific clip —
+            # regenerate this clip without them rather than failing the project.
             set_stage(f"🎬 Step 4/5 — clip {i + 1}/{n} retry without reference")
             result = generate_video(
-                job["auth"], job["model"], fr["prompt"], None, None,
+                job["auth"], job["model"], fr["prompt"], None,
                 fr["duration"], job.get("thinking_level", "medium"),
                 job.get("aspect_ratio", "9:16"))
             if result["ok"]:
@@ -1171,8 +1175,16 @@ def save_jobs_db(store):
         JOBS_DB_PATH.write_text(json.dumps(store["jobs"], indent=1))
 
 
-def _job_image(job):
-    return base64.b64decode(job["image_b64"]) if job.get("image_b64") else None
+def _job_media(job) -> list:
+    """All reference media on a job as (bytes, mime) tuples. Reads the new
+    multi-file ref_media list, falling back to the legacy single-image fields."""
+    out = []
+    for m in job.get("ref_media") or []:
+        if m.get("b64"):
+            out.append((base64.b64decode(m["b64"]), m.get("mime")))
+    if not out and job.get("image_b64"):
+        out.append((base64.b64decode(job["image_b64"]), job.get("image_mime")))
+    return out
 
 
 def process_job(store, job):
@@ -1184,7 +1196,7 @@ def process_job(store, job):
         if job["mode"] == "video":
             result = generate_video(
                 job["auth"], job["model"], job["final_prompt"],
-                _job_image(job), job.get("image_mime"),
+                _job_media(job),
                 job.get("duration_s") or 12, job.get("thinking_level", "medium"),
                 job.get("aspect_ratio", "9:16"),
                 video_task=job.get("video_task"))
@@ -1248,7 +1260,13 @@ def get_store():
 store = get_store()
 
 
-def add_job(prompt: str, image_file=None, video_task: str | None = None):
+def _pack_ref_files(files) -> list:
+    return [{"name": f.name, "mime": f.type,
+             "b64": base64.b64encode(f.getvalue()).decode()}
+            for f in (files or [])]
+
+
+def add_job(prompt: str, ref_files=None, video_task: str | None = None):
     """Snapshot ALL current settings into the job — the full request body."""
     job = {
         "id": uuid.uuid4().hex[:8],
@@ -1265,10 +1283,7 @@ def add_job(prompt: str, image_file=None, video_task: str | None = None):
         "variations": int(variations),
         "auth": dict(auth),
         "drive_upload": bool(drive_enabled and drive_folder_id),
-        "image_name": image_file.name if image_file else None,
-        "image_b64": base64.b64encode(image_file.getvalue()).decode()
-                     if image_file else None,
-        "image_mime": image_file.type if image_file else None,
+        "ref_media": _pack_ref_files(ref_files),
         "video_task": video_task,
         "status": "queued",
         "results": [],
@@ -1279,17 +1294,14 @@ def add_job(prompt: str, image_file=None, video_task: str | None = None):
 
 
 def add_narration_job(script: str, voice_id: str, voice_name: str, gender: str,
-                      ref_file=None):
+                      ref_files=None):
     """Queue a full script→narration→frames→stitched-video pipeline job."""
     job_id = uuid.uuid4().hex[:8]
     job = {
         "id": job_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "mode": "narration",
-        "image_name": ref_file.name if ref_file else None,
-        "image_b64": base64.b64encode(ref_file.getvalue()).decode()
-                     if ref_file else None,
-        "image_mime": ref_file.type if ref_file else None,
+        "ref_media": _pack_ref_files(ref_files),
         "script": script.strip(),
         "prompt": script.strip()[:120],  # for shared queue displays
         "voice_id": voice_id,
@@ -1614,9 +1626,10 @@ with tab_single:
         prompt = st.text_area("Prompt", height=120,
                               placeholder="Shiva meditating on Mount Kailash as dawn light "
                                           "breaks through the clouds...")
-        image = st.file_uploader(
-            "Reference image or video (optional, video mode only)",
-            type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm"])
+        ref_files = st.file_uploader(
+            "Reference images / videos (optional, video mode only — attach several)",
+            type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm"],
+            accept_multiple_files=True)
         VIDEO_TASKS = {
             "🎨 Style / content reference (reference_to_video)": "reference_to_video",
             "➕ Continue it (extend)": "extend",
@@ -1627,14 +1640,16 @@ with tab_single:
             help="Only applies when the uploaded reference is a video. Images "
                  "always use image_to_video.")
         if st.form_submit_button("Add to queue", type="primary"):
+            oversized = [f.name for f in (ref_files or [])
+                         if f.size > 25 * 1024 * 1024]
             if not prompt.strip():
                 st.warning("Prompt is empty.")
-            elif image is not None and (image.type or "").startswith("video") \
-                    and len(image.getvalue()) > 25 * 1024 * 1024:
-                st.warning("Reference video is too large — keep it under 25 MB "
-                           "(it is sent inline with the API request).")
+            elif oversized:
+                st.warning(f"Too large (keep each under 25 MB): "
+                           f"{', '.join(oversized)} — files are sent inline "
+                           "with the API request.")
             else:
-                add_job(prompt, image, VIDEO_TASKS[video_task_label])
+                add_job(prompt, ref_files, VIDEO_TASKS[video_task_label])
                 st.success("Job added.")
 
     st.divider()
@@ -1689,14 +1704,23 @@ with tab_single:
                            + (f" · {job.get('duration_s')}s" if job.get("mode") == "video" else "")
                            + f" · {job.get('variations', 1)} variation(s)"
                            + (" · ☁️ Drive" if job.get("drive_upload") else ""))
-                if job.get("image_b64"):
-                    ref_bytes = base64.b64decode(job["image_b64"])
-                    if (job.get("image_mime") or "").startswith("video"):
-                        st.video(ref_bytes)
-                        st.caption(f"Reference video: {job.get('image_name')} · "
-                                   f"task: {job.get('video_task') or 'reference_to_video'}")
-                    else:
-                        st.image(ref_bytes, caption=job.get("image_name"), width=220)
+                ref_items = list(job.get("ref_media") or [])
+                if not ref_items and job.get("image_b64"):
+                    ref_items = [{"name": job.get("image_name"),
+                                  "mime": job.get("image_mime"),
+                                  "b64": job["image_b64"]}]
+                if ref_items:
+                    st.caption(f"{len(ref_items)} reference file(s) · task: "
+                               f"{job.get('video_task') or 'auto'}")
+                    for m in ref_items:
+                        if not m.get("b64"):
+                            continue
+                        ref_bytes = base64.b64decode(m["b64"])
+                        if (m.get("mime") or "").startswith("video"):
+                            st.video(ref_bytes)
+                            st.caption(m.get("name") or "video")
+                        else:
+                            st.image(ref_bytes, caption=m.get("name"), width=220)
                 else:
                     st.caption("No reference media.")
                 if st.button("Remove", key=f"rm_{job['id']}",
@@ -1814,8 +1838,11 @@ def render_narration_job(job):
                      f"**{nar.get('n_clips')} scenes**")
         if job.get("drive_upload"):
             info += " · ☁️ Drive"
-        if job.get("image_name"):
-            info += f" · 🎞️ ref: {job['image_name']}"
+        ref_names = [m.get("name") for m in job.get("ref_media") or [] if m.get("name")]
+        if not ref_names and job.get("image_name"):
+            ref_names = [job["image_name"]]
+        if ref_names:
+            info += f" · 🎞️ refs: {', '.join(ref_names)}"
         st.caption(info)
 
         # ---- Step 1: narration audio + timestamps -----------------------------
@@ -1983,12 +2010,13 @@ with tab_script:
         "Script (Hindi narration)", height=200, key="narration_script",
         placeholder="अपनी कहानी यहाँ लिखें… (the full narration script — the voice-over "
                     "is generated from this text exactly)")
-    narration_ref = st.file_uploader(
-        "Reference image or video (optional — style/persona anchor for ALL clips)",
+    narration_refs = st.file_uploader(
+        "Reference images / videos (optional — style/persona anchors for ALL clips)",
         type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm"],
-        key="narration_ref",
-        help="Sent with every clip generation as a reference_to_video anchor so "
-             "characters, style and setting stay consistent across all scenes.")
+        key="narration_ref", accept_multiple_files=True,
+        help="All attached files are sent with every clip generation as "
+             "reference_to_video anchors so characters, style and setting stay "
+             "consistent across all scenes.")
     st.caption("Example: a 53s narration → RoundUp(53/10) = **6 clips** of ≤10s each, "
                "generated with a consistent style bible and stitched over the audio. "
                "Video model / aspect ratio / Drive upload come from the sidebar.")
@@ -2000,11 +2028,11 @@ with tab_script:
             st.warning("Add your ElevenLabs API key in the voice settings above.")
         elif not narration_voice_id:
             st.warning("Pick a voice (or paste a voice ID) in the voice settings above.")
-        elif narration_ref is not None and narration_ref.size > 25 * 1024 * 1024:
-            st.warning("Reference file is too large — keep it under 25 MB.")
+        elif any(f.size > 25 * 1024 * 1024 for f in (narration_refs or [])):
+            st.warning("A reference file is too large — keep each under 25 MB.")
         else:
             add_narration_job(script_text, narration_voice_id,
-                              narration_voice_name, voice_gender, narration_ref)
+                              narration_voice_name, voice_gender, narration_refs)
             st.success("Narration pipeline queued — it runs in the background.")
             st.rerun()
 
