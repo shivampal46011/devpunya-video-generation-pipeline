@@ -1089,6 +1089,18 @@ def process_narration_job(store, job):
             fr["duration"], job.get("thinking_level", "medium"),
             job.get("aspect_ratio", "9:16"),
             video_task="reference_to_video" if job.get("image_b64") else None)
+        if (not result["ok"] and job.get("image_b64")
+                and ("invalid" in str(result.get("error", "")).lower()
+                     or "400" in str(result.get("error", "")))):
+            # The API sometimes rejects the reference for a specific clip —
+            # regenerate this clip without it rather than failing the project.
+            set_stage(f"🎬 Step 4/5 — clip {i + 1}/{n} retry without reference")
+            result = generate_video(
+                job["auth"], job["model"], fr["prompt"], None, None,
+                fr["duration"], job.get("thinking_level", "medium"),
+                job.get("aspect_ratio", "9:16"))
+            if result["ok"]:
+                result["note"] = "reference rejected for this clip — generated without it"
         with store["lock"]:
             fr["result"] = result
         save_jobs_db(store)
